@@ -176,11 +176,38 @@ runs:
 
         # The ONLY trigger path. Remove-then-add fires `labeled`, which pr-e2e-tests.yml listens for.
         # GitHub's "Re-run jobs" is NOT equivalent — it replays the old merge ref.
+        #
+        # MUST use a PAT, NOT GITHUB_TOKEN. Anything done with GITHUB_TOKEN raises NO events —
+        # GitHub's loop prevention. The label really is removed and re-added, the API returns 200,
+        # the timeline shows both events, and NO workflow starts. This has now bitten in three
+        # forms: releases (on: release), tags (on: push: tags), and now labels. Verified on os#381:
+        # a recycle by github-actions[bot] triggered nothing; the same recycle by a human did.
         recycle_label() {
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels/${LABEL}" >/dev/null 2>&1 || true
+          local t="${OPS_TOKEN:-}"
+          if [ -z "$t" ]; then
+            echo "::error::no PAT available to recycle the label — GITHUB_TOKEN cannot trigger a run"
+            RC=1; return 1
+          fi
+          GH_TOKEN="$t" gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels/${LABEL}" >/dev/null 2>&1 || true
           sleep 2
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" -f "labels[]=${LABEL}" >/dev/null \
-            || { echo "::error::could not re-add the ${LABEL} label — no run was triggered"; RC=1; }
+          GH_TOKEN="$t" gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" -f "labels[]=${LABEL}" >/dev/null \
+            || { echo "::error::could not re-add the ${LABEL} label with the PAT — no run was triggered"; RC=1; return 1; }
+          echo "recycled the ${LABEL} label using the PAT"
+        }
+
+        # Do not claim a run started without looking. A silently-dead trigger is exactly the failure
+        # this command exists to remove, so if nothing appears, say so instead of reporting success.
+        confirm_triggered() {
+          local before="$1" after i
+          for i in 1 2 3 4 5 6; do
+            sleep 5
+            after=$(gh run list -R "$GITHUB_REPOSITORY" --workflow=pr-e2e-tests.yml --limit 5 \
+                      --json databaseId --jq '[.[].databaseId] | max' 2>/dev/null || echo 0)
+            [ -n "$after" ] && [ "$after" != "$before" ] && { echo "new caller run: $after"; return 0; }
+          done
+          echo "::error::the ${LABEL} label was recycled but no caller run appeared within 30s"
+          RC=1
+          return 1
         }
 
         echo "executing $CMD for #${PR} (source_repo=$SOURCE_REPO, requested by $WHO)"
@@ -320,8 +347,16 @@ runs:
               gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$MBODY" >/dev/null 2>&1 || true
             fi
 
-            recycle_label
-            if [ "$MODE" = selective ]; then
+            BEFORE=$(gh run list -R "$GITHUB_REPOSITORY" --workflow=pr-e2e-tests.yml --limit 5 \
+                       --json databaseId --jq '[.[].databaseId] | max' 2>/dev/null || echo 0)
+            recycle_label && confirm_triggered "$BEFORE" || TRIGGER_FAILED=1
+            if [ "${TRIGGER_FAILED:-0}" = 1 ]; then
+              say "$(printf '%s\n' "### ⚠️ Could not start the run" "" \
+                "The \`${LABEL}\` label was recycled but no run appeared. Please remove the label and add it" \
+                "back by hand — that always works." "" \
+                "_A maintainer should check the handler's PAT: a label change made with GITHUB_TOKEN" \
+                "raises no events, so the trigger silently does nothing._")"
+            elif [ "$MODE" = selective ]; then
               N=$(printf '%s' "$SPECS" | wc -w | tr -d ' ')
               say "$(printf '%s\n' "### Re-running ${N} spec file(s) — requested by @${WHO}" "" \
                 '```' "$(printf '%s' "$SPECS" | tr ' ' '\n')" '```' \
