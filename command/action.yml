@@ -130,7 +130,18 @@ runs:
         SOURCE_REPO: ${{ inputs.source_repo }}
         LABEL: ${{ inputs.label }}
       run: |
+        # `shell: bash` runs this with `-e -o pipefail`. Under -e, `C=$(f)` where f exits non-zero
+        # kills the shell INSTANTLY and SILENTLY — no error, no line number. That is exactly what
+        # happened to /status: it printed "executing" and vanished, with a GREEN workflow the first
+        # time. `set -uo pipefail` does NOT disable -e; only `set +e` does.
+        #
+        # This handler is mostly best-effort API calls where one failure should be REPORTED, not
+        # abort everything. So errexit is off and what matters is checked explicitly: say() and
+        # recycle_label() set RC, and the step exits on RC at the end.
+        # (Same class as the bash -e bug that made the eviction-retry branch dead code in os#367.)
+        set +e
         set -uo pipefail
+        RC=0
         OPS=iblai/iblai-deploy-ops
         # Report failures instead of swallowing them. `>/dev/null 2>&1 || true` meant a failed POST
         # looked identical to a successful one: workflow green, log empty, user sees nothing happen
@@ -140,6 +151,7 @@ runs:
           out=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$1" 2>&1); rc=$?
           if [ $rc -ne 0 ]; then
             echo "::error::could not post the reply comment (exit $rc): ${out}"
+            RC=1
             return 1
           fi
           echo "posted reply comment"
@@ -150,16 +162,16 @@ runs:
         central_run() {
           GH_TOKEN="$OPS_TOKEN" gh run list -R "$OPS" --workflow=pr-e2e.yml --limit 30 \
             --json databaseId,status,conclusion,displayTitle,createdAt \
-            --jq "[.[] | select(.displayTitle | startswith(\"PR e2e — ${SOURCE_REPO}#${PR} →\"))] | sort_by(.createdAt) | .[-1] // empty" 2>/dev/null
+            --jq "[.[] | select(.displayTitle | startswith(\"PR e2e — ${SOURCE_REPO}#${PR} →\"))] | sort_by(.createdAt) | .[-1] // empty" 2>/dev/null || true
         }
         caller_run() {
           gh run list -R "$GITHUB_REPOSITORY" --workflow=pr-e2e-tests.yml --limit 30 \
             --json databaseId,status,conclusion,displayTitle,createdAt \
-            --jq "[.[] | select(.displayTitle | test(\"#${PR} \"))] | sort_by(.createdAt) | .[-1] // empty" 2>/dev/null
+            --jq "[.[] | select(.displayTitle | test(\"#${PR} \"))] | sort_by(.createdAt) | .[-1] // empty" 2>/dev/null || true
         }
-        # jq rather than an embedded python heredoc: this whole block gets indented into a YAML
-        # block scalar, so a multi-line heredoc arrives with uniform leading whitespace and dies on
-        # IndentationError. `bash -n` does not catch it — it would have failed only at runtime.
+        # jq rather than an embedded python heredoc: single-line, so it survives editing and
+        # re-indentation without care. (An indented heredoc would also work — YAML strips the block
+        # indentation — but one-liners are harder to break.)
         jfield() { printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // ""' 2>/dev/null || true; }
 
         # The ONLY trigger path. Remove-then-add fires `labeled`, which pr-e2e-tests.yml listens for.
@@ -167,7 +179,8 @@ runs:
         recycle_label() {
           gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels/${LABEL}" >/dev/null 2>&1 || true
           sleep 2
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" -f "labels[]=${LABEL}" >/dev/null 2>&1
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" -f "labels[]=${LABEL}" >/dev/null \
+            || { echo "::error::could not re-add the ${LABEL} label — no run was triggered"; RC=1; }
         }
 
         echo "executing $CMD for #${PR} (source_repo=$SOURCE_REPO, requested by $WHO)"
@@ -307,4 +320,8 @@ runs:
             fi
             ;;
         esac
+        if [ "$RC" -ne 0 ]; then
+          echo "::error::$CMD did not complete cleanly"
+          exit "$RC"
+        fi
         echo "$CMD complete"
