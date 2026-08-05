@@ -85,63 +85,20 @@ runs:
           echo "full suite (changed specs=$N, non-spec changes=${OTHER:-none})"
         fi
 
-    - name: Pick a target environment
-      id: env
-      env:
-        GH_TOKEN: ${{ inputs.dispatch_token }}
-      shell: bash
-      run: |
-        set -uo pipefail
-        # stg2 is DISABLED as a PR-e2e target for now — flip ENABLE_STG2 to 1 to restore overflow.
-        #
-        # Why it is off: the picker can only observe whether a runner is currently EXECUTING work.
-        # An OFFLINE runner is indistinguishable from an idle one, so on 2026-07-29 a PR failed over
-        # to stg2 while stg2-spa was down, the job queued for ~2h, and the caller timed out with no
-        # useful diagnosis. Availability cannot be inferred from "not busy" without the org runners
-        # API, which this token deliberately does not have.
-        ENABLE_STG2=0
-
-        if [ "$ENABLE_STG2" != "1" ]; then
-          echo "target=stg1" >> "$GITHUB_OUTPUT"
-          echo "target env: stg1 (stg2 overflow disabled)"
-          exit 0
-        fi
-
-        runners() {
-          local filter="$1" limit="$2" id
-          for id in $(gh run list -R iblai/iblai-deploy-ops --limit "$limit" \
-                        --json databaseId --jq '.[].databaseId' 2>/dev/null); do
-            gh api "repos/iblai/iblai-deploy-ops/actions/runs/$id/jobs" --jq "$filter" 2>/dev/null
-          done
-        }
-        BUSY=$(runners '.jobs[] | select(.status=="in_progress") | .runner_name // empty' 20)
-        SEEN=$(runners '.jobs[].runner_name // empty' 20)
-        has() { printf '%s' "$2" | tr -s '[:space:]' '\n' | grep -qx "$1"; }
-
-        if ! has stg1-spa "$BUSY"; then
-          TARGET=stg1; WHY="stg1 free"
-        elif has stg2-spa "$SEEN" && ! has stg2-spa "$BUSY"; then
-          TARGET=stg2; WHY="stg1 busy, stg2 free — failing over"
-        else
-          TARGET=stg1; WHY="stg1 busy, stg2 unavailable or also busy — queueing on stg1"
-        fi
-        echo "target=$TARGET" >> "$GITHUB_OUTPUT"
-        echo "target env: $TARGET ($WHY)"
     - name: Dispatch e2e and wait for the result
       id: dispatch
       env:
         SOURCE_REPO: ${{ inputs.source_repo }}
         GH_TOKEN: ${{ inputs.dispatch_token }}
         PR: ${{ inputs.pr_number }}
-        TARGET_ENV: ${{ steps.env.outputs.target }}
       shell: bash
       run: |
         set -uo pipefail
-        TARGET="$TARGET_ENV"
-        RUNNER="${TARGET}-spa"
         OPS=iblai/iblai-deploy-ops
         # The central run-name, reproduced exactly, so we can find OUR runs and only ours.
-        MYTITLE="PR e2e — ${SOURCE_REPO}#${PR} → ${TARGET}"
+        # Prefix only, deliberately: the environment is chosen centrally, so this must match this
+        # PR's run whichever box it lands on. Naming an env here is what broke before.
+        MYTITLE="PR e2e — ${SOURCE_REPO}#${PR} →"
 
         # A superseded caller (label removed+re-added, or a new push) leaves the central run it
         # already dispatched ORPHANED: nothing polls it, its result is discarded, yet it holds the
@@ -208,7 +165,6 @@ runs:
             -f merge_sha='${{ inputs.merge_sha }}' \
             -f head_sha='${{ inputs.head_sha }}' \
             -f app_image='${{ inputs.app_image }}' \
-            -f target_env="$TARGET" \
             -f mode='${{ steps.specs.outputs.mode }}' \
             -f specs='${{ steps.specs.outputs.specs }}' || return 1
           for i in $(seq 1 30); do

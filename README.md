@@ -56,6 +56,25 @@ applies to every PR immediately — including PRs opened months ago, with no reb
 
 `conclusion` — the central run's conclusion · `run_id` — the dispatched run id
 
+## Which environment does it run on?
+
+**This action does not choose, and deliberately cannot.** It sends no `target_env`; the central
+`pr-e2e.yml` resolves `${{ vars.PR_E2E_ENV || inputs.target_env }}` — one variable in
+`iblai/iblai-deploy-ops`, consulted by every consumer (`concurrency`, `environment`, the runner
+lookup, the report path, `run-name`).
+
+Earlier versions probed the runners here and picked stg1 or stg2. That gave the caller a *requested*
+env that a central override could silently contradict, which was the precondition for both
+2026-08-04 incidents — a live-lock and a bug that abandoned four healthy runs. With one source of
+truth the two values cannot disagree, because there is only one.
+
+Operators move all PR traffic in one command, with no PR and no rebase:
+
+```sh
+gh variable set PR_E2E_ENV --body stg2 -R iblai/iblai-deploy-ops
+gh variable delete PR_E2E_ENV -R iblai/iblai-deploy-ops   # back to the stg1 default
+```
+
 ## Selective runs
 
 Most failures are a single flaky spec, and re-running all 621 tests to re-check one is what makes
