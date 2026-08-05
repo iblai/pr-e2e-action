@@ -44,6 +44,14 @@ inputs:
   dispatch_token:
     description: 'PAT with Actions read/write on iblai/iblai-deploy-ops — /status and /cancel'
     required: true
+  label_token:
+    description: >
+      PAT with issues:write on THIS repo, used only to recycle the trigger label for /retest.
+      REQUIRED for /retest. It cannot be GITHUB_TOKEN: a label set with GITHUB_TOKEN raises no
+      events, so the recycle succeeds and no run ever starts. Falls back to dispatch_token, which
+      works only if that PAT also has write access here.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -123,6 +131,7 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.repo_token }}
         OPS_TOKEN: ${{ inputs.dispatch_token }}
+        LABEL_TOKEN: ${{ inputs.label_token }}
         CMD: ${{ steps.parse.outputs.cmd }}
         ARGS: ${{ steps.parse.outputs.args }}
         PR: ${{ inputs.pr_number }}
@@ -183,7 +192,8 @@ runs:
         # forms: releases (on: release), tags (on: push: tags), and now labels. Verified on os#381:
         # a recycle by github-actions[bot] triggered nothing; the same recycle by a human did.
         recycle_label() {
-          local t="${OPS_TOKEN:-}"
+          local t="${LABEL_TOKEN:-}"
+          [ -z "$t" ] && t="${OPS_TOKEN:-}"
           if [ -z "$t" ]; then
             echo "::error::no PAT available to recycle the label — GITHUB_TOKEN cannot trigger a run"
             RC=1; return 1
@@ -191,7 +201,7 @@ runs:
           GH_TOKEN="$t" gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels/${LABEL}" >/dev/null 2>&1 || true
           sleep 2
           GH_TOKEN="$t" gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" -f "labels[]=${LABEL}" >/dev/null \
-            || { echo "::error::could not re-add the ${LABEL} label with the PAT — no run was triggered"; RC=1; return 1; }
+            || { echo "::error::the PAT cannot write labels on ${GITHUB_REPOSITORY} — set the label_token input to a PAT with issues:write here. GITHUB_TOKEN cannot be used: labels it sets raise no events."; RC=1; return 1; }
           echo "recycled the ${LABEL} label using the PAT"
         }
 
