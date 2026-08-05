@@ -99,7 +99,8 @@ runs:
         if [ "$OK" != "yes" ]; then
           echo "authorized=no — $WHY"
           B=$(printf '%s\n' "🚫 **Not authorized.** ${WHY}" "" "_No test run was started and no environment was touched._")
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$B" >/dev/null 2>&1 || true
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$B" >/dev/null \
+            || echo "::error::could not post the not-authorized notice"
           exit 0
         fi
         echo "authorized=yes"
@@ -114,7 +115,8 @@ runs:
         # A 👀 within seconds tells the author the command was seen. Without it, the gap between commenting
         # and a run appearing reads as "nothing happened" — which is what sends people to ask a maintainer,
         # the exact interruption these commands exist to remove.
-        gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/comments/${CID}/reactions" -f content='eyes' >/dev/null 2>&1 || true
+        gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/comments/${CID}/reactions" -f content='eyes' >/dev/null 2>&1 \
+          || echo "::warning::could not add the 👀 acknowledgement reaction"
     - name: Run the command
       if: steps.parse.outputs.match == 'yes' && steps.auth.outputs.ok == 'yes'
       shell: bash
@@ -130,7 +132,18 @@ runs:
       run: |
         set -uo pipefail
         OPS=iblai/iblai-deploy-ops
-        say() { gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$1" >/dev/null 2>&1 || true; }
+        # Report failures instead of swallowing them. `>/dev/null 2>&1 || true` meant a failed POST
+        # looked identical to a successful one: workflow green, log empty, user sees nothing happen
+        # and has no way to find out why. If the reply cannot be posted, that IS the failure.
+        say() {
+          local out rc
+          out=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$1" 2>&1); rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "::error::could not post the reply comment (exit $rc): ${out}"
+            return 1
+          fi
+          echo "posted reply comment"
+        }
 
         # Newest central run for this PR, whatever env it landed on. Prefix match that STOPS BEFORE the
         # env — naming an env in a title match is exactly what caused the 2026-08-04 live-lock.
@@ -157,6 +170,7 @@ runs:
           gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" -f "labels[]=${LABEL}" >/dev/null 2>&1
         }
 
+        echo "executing $CMD for #${PR} (source_repo=$SOURCE_REPO, requested by $WHO)"
         case "$CMD" in
           /help|/e2e-help)
             say "$(printf '%s\n' \
@@ -293,3 +307,4 @@ runs:
             fi
             ;;
         esac
+        echo "$CMD complete"
