@@ -69,6 +69,34 @@ specs: e2e/journeys/34-workflows.spec.ts
 Roughly **3–5 minutes instead of ~45**. Auto-detection still applies when `mode: auto`: a PR that
 touches only spec files (≤5) runs just those; anything touching app source runs the full suite.
 
+## Cancellation cleanup lives in the CALLER, not here
+
+A composite action is **terminated when the job is cancelled**, so an `if: cancelled()` step inside
+this action would never run. Cleanup must therefore be a job step in the calling workflow:
+
+```yaml
+      - uses: iblai/pr-e2e-action@v1
+        id: e2e
+        with: { ... }
+
+      - name: Cancel the dispatched central run if this caller is cancelled
+        if: cancelled()
+        env: { GH_TOKEN: "${{ secrets.DEPLOY_OPS_DISPATCH_TOKEN }}" }
+        run: |
+          F="$RUNNER_TEMP/pr-e2e-run-id"
+          [ -s "$F" ] || { echo "nothing to cancel"; exit 0; }
+          gh run cancel "$(cat "$F")" -R iblai/iblai-deploy-ops || true
+```
+
+This matters on the routine path, not an edge case: callers use `cancel-in-progress: true`, and a
+label recycle fires two events, so the first caller is cancelled on essentially every re-tag.
+Without this the dispatched central run orphans — holding an environment for a full suite, producing
+a result nobody reads, and sometimes passing while the PR shows red.
+
+**The run id comes from `$RUNNER_TEMP/pr-e2e-run-id`**, which this action writes the moment it
+dispatches — not from `steps.e2e.outputs.run_id`. A composite action's declared outputs are only
+published when it *completes*, and by definition it has not completed when cancelled.
+
 ## Versioning
 
 - `v1.0.0`, `v1.1.0`, … are **immutable**

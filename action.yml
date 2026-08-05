@@ -323,6 +323,9 @@ runs:
           do_dispatch  || { echo "::error::dispatched but the run never appeared"; echo "conclusion=dispatch_failed" >> "$GITHUB_OUTPUT"; exit 1; }
           echo "dispatched run $RUN_ID (attempt $attempt)"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+        # See the caller's "Cancel the dispatched central run" step: composite actions are
+        # terminated on cancellation, so cleanup cannot live in here and needs this file.
+        echo "$RUN_ID" > "$RUNNER_TEMP/pr-e2e-run-id"
           # `run:` steps execute under `bash -e` (see the job log's "shell: /usr/bin/bash -e {0}"),
           # and `set -uo pipefail` above does NOT clear errexit. A bare `poll_run; rc=$?` therefore
           # terminates the whole step the instant poll_run returns non-zero — so the eviction branch
@@ -346,21 +349,6 @@ runs:
           echo "::notice::QUEUE_EVICTION_COUNT=${EVICTIONS} for this PR"
         fi
         echo "conclusion=${CONCLUSION:-unknown}" >> "$GITHUB_OUTPUT"
-    - name: Cancel the dispatched run if this caller is cancelled
-      # A caller can be superseded (concurrency: pr-e2e-<PR>, cancel-in-progress) or cancelled by
-      # hand — but the central run it dispatched keeps going. That orphan occupies the single env
-      # runner for a full suite, produces a result nobody reads, and deepens the queue for everyone
-      # else. Worse, it can PASS while the PR shows red: os#394 did exactly that (456/0/3 green,
-      # PR reported "unknown"), because the surviving caller was watching a different run.
-      if: cancelled() && steps.dispatch.outputs.run_id != ''
-      env:
-        GH_TOKEN: ${{ inputs.dispatch_token }}
-        RUN_ID: ${{ steps.dispatch.outputs.run_id }}
-      shell: bash
-      run: |
-        echo "caller cancelled — cancelling central run ${RUN_ID} so it does not orphan"
-        gh run cancel "$RUN_ID" -R iblai/iblai-deploy-ops || true
-
     - name: Publish the result on this PR
       if: always() && steps.dispatch.outputs.run_id != ''
       env:
