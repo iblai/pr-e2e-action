@@ -228,23 +228,37 @@ runs:
             if [ -z "$RID" ]; then
               say "No central run found for this PR yet. Add the \`${LABEL}\` label or comment \`/retest\` to start one."
             else
-              BASE="https://tests.iblai.app/runs/pr-${SOURCE_REPO}-${PR}-${RID}"
-              FOUND=""
-              for P in mentor skills; do
-                curl -sfI --max-time 15 "${BASE}/${P}/index.html" >/dev/null 2>&1 || continue
-                V=$(curl -sf --max-time 20 "${BASE}/${P}/summary.json" 2>/dev/null \
-              | jq -r '"\(.verdict // "?") — \(.totals.passed // "?") passed / \(.totals.failed // "?") failed / \(.totals.flaky // "?") flaky"' 2>/dev/null || echo "report available")
-                FOUND="${FOUND}- **${P}:** [report](${BASE}/${P}/index.html) — ${V}"$'\n'
-              done
-              if [ -n "$FOUND" ]; then
-                say "$(printf '%s\n' "### Latest report — #${PR}" "" "${FOUND}" \
+              # AUTHORITATIVE SOURCE: the central run's own pr-e2e-result artifact carries
+              # report_url. The previous version probed tests.iblai.app with curl and declared
+              # "no report is published yet" when the probe failed — which told a user their report
+              # did not exist while it sat there returning 200. A network probe from the runner is
+              # not evidence about whether a report was produced; the run's own artifact is.
+              REPORT=""; VERD=""
+              if GH_TOKEN="$OPS_TOKEN" gh run download "$RID" -R "$OPS" -n pr-e2e-result -D /tmp/rep >/dev/null 2>&1; then
+                REPORT=$(jq -r '.report_url // ""' /tmp/rep/pr-e2e-result.json 2>/dev/null || echo "")
+                VERD=$(jq -r '"\(.verdict // "?") — \(.failed // "?") failed, \(.new_failures // "?") new"' /tmp/rep/pr-e2e-result.json 2>/dev/null || echo "")
+                echo "artifact report_url=${REPORT:-<none>}"
+              else
+                echo "no pr-e2e-result artifact on run $RID (still running, or it expired)"
+              fi
+
+              if [ -n "$REPORT" ]; then
+                say "$(printf '%s\n' "### Latest report — #${PR}" "" \
+                  "**[Full report, traces and screenshots](${REPORT})**" "" \
+                  "${VERD}" "" \
                   "_From [central run ${RID}](https://github.com/iblai/iblai-deploy-ops/actions/runs/${RID})._")"
               else
-                say "A central run exists ([${RID}](https://github.com/iblai/iblai-deploy-ops/actions/runs/${RID})) but no report is published yet — it is probably still running. Try \`/status\`."
+                # No artifact yet. Still give the conventional path rather than asserting there is
+                # no report — the run may simply not have finished publishing.
+                BASE="https://tests.iblai.app/runs/pr-${SOURCE_REPO}-${PR}-${RID}"
+                say "$(printf '%s\n' "### Report — #${PR}" "" \
+                  "[Central run ${RID}](https://github.com/iblai/iblai-deploy-ops/actions/runs/${RID}) has not published a result artifact yet — it is probably still running (\`/status\` shows progress)." "" \
+                  "If it has finished, the report is normally at:" \
+                  "- ${BASE}/mentor/index.html" \
+                  "- ${BASE}/skills/index.html")"
               fi
             fi
             ;;
-
           /cancel)
             C=$(central_run); L=$(caller_run); DID=""
             CST=$(jfield "$C" status); LST=$(jfield "$L" status)
