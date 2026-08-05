@@ -75,6 +75,54 @@ gh variable set PR_E2E_ENV --body stg2 -R iblai/iblai-deploy-ops
 gh variable delete PR_E2E_ENV -R iblai/iblai-deploy-ops   # back to the stg1 default
 ```
 
+## Slash commands — `iblai/pr-e2e-action/command@v1`
+
+A second action in this repo handles PR comments, so nobody has to remember the label ritual:
+
+| command | what it does |
+|---|---|
+| `/retest` | re-run the full suite |
+| `/retest <spec>` | re-run only matching spec files — **minutes instead of ~45** |
+| `/status` | queue position and what is running |
+| `/report` | link to the latest report |
+| `/cancel` | stop this PR's run and free the environment |
+
+`<spec>` is a substring, so `/retest 34` and `/retest 34-workflows` both resolve to
+`e2e/journeys/34-workflows.spec.ts`. Several are allowed. An unmatched token starts nothing and
+says so, rather than silently running everything.
+
+### Why it recycles the label instead of dispatching
+
+The handler's only trigger action is remove-then-add of `run-tests`. It never calls the central
+pipeline directly. Two reasons, and the second is the one that bites:
+
+- there is a single trigger path to reason about and secure, not two;
+- a PR's **required check** only updates when the caller workflow runs. A command that produced a
+  report without refreshing the check would look like it worked while leaving the PR unmergeable.
+
+### Security on a public repo
+
+`issue_comment` workflows always run from the **default branch**, never from the PR — so a fork PR
+cannot edit the handler to weaken its own checks. On top of that the action requires
+**write/maintain/admin** via `repos/{repo}/collaborators/{user}/permission`, and refuses fork PRs.
+
+Authorization deliberately does **not** use `author_association`: it reports `MEMBER` for any org
+member, including people with no write access to the repo, who would then be able to occupy a
+shared test environment.
+
+### How `/retest <spec>` reaches the run
+
+The handler writes a marker comment and recycles the label. The root action reads that marker at
+the start of the run and honours it only if **both** hold:
+
+- it was authored by `github-actions[bot]` — a user cannot post as the bot, so hand-writing the
+  comment cannot bypass the permission check; and
+- its `head_sha` matches the commit under test — otherwise a selective request made against an
+  earlier commit would silently narrow a **later** push's run to a few files, leaving the rest of
+  the suite untested while the required check went green.
+
+Either check failing falls back to normal auto-detection. A malformed marker is ignored.
+
 ## Selective runs
 
 Most failures are a single flaky spec, and re-running all 621 tests to re-check one is what makes

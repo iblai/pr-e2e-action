@@ -63,9 +63,34 @@ runs:
         MODE_IN: ${{ inputs.mode }}
         SPECS_IN: ${{ inputs.specs }}
         HEAD: ${{ inputs.head_sha }}
+        PR: ${{ inputs.pr_number }}
+        REPO_TOKEN: ${{ inputs.repo_token }}
       shell: bash
       run: |
         set -euo pipefail
+        # A `/retest <spec>` command leaves a marker comment. Trust it only if BOTH hold:
+        #   * authored by github-actions[bot] — a user cannot post as the bot, so the handler's
+        #     authorization check cannot be sidestepped by hand-writing this comment; and
+        #   * its head_sha matches the commit under test — otherwise a selective request made
+        #     against an older commit would silently narrow a LATER push's run to a few files,
+        #     leaving the rest of the suite untested while the required check went green.
+        if [ -z "${MODE_IN:-}" ] || [ "$MODE_IN" = auto ]; then
+          M=$(GH_TOKEN="$REPO_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+                --jq '[.[] | select(.user.login=="github-actions[bot]") | select(.body | startswith("<!-- pr-e2e-cmd -->"))] | .[-1].body // empty' 2>/dev/null || true)
+          if [ -n "$M" ]; then
+            J=$(printf '%s' "$M" | tail -n +2)
+            C_MODE=$(printf '%s' "$J" | jq -r '.mode // ""' 2>/dev/null || echo "")
+            C_SPECS=$(printf '%s' "$J" | jq -r '.specs // ""' 2>/dev/null || echo "")
+            C_SHA=$(printf '%s' "$J" | jq -r '.head_sha // ""' 2>/dev/null || echo "")
+            C_BY=$(printf '%s' "$J" | jq -r '.by // ""' 2>/dev/null || echo "")
+            if [ -n "$C_MODE" ] && [ "$C_SHA" = "$HEAD" ]; then
+              MODE_IN="$C_MODE"; SPECS_IN="$C_SPECS"
+              echo "::notice::/retest by ${C_BY:-?} -> mode=$MODE_IN specs=${SPECS_IN:-<all>}"
+            elif [ -n "$C_SHA" ]; then
+              echo "::notice::ignoring a /retest marker from an older commit (${C_SHA:0:8} != ${HEAD:0:8}) - running normal detection"
+            fi
+          fi
+        fi
         CHANGED=$(git diff --name-only "$BASE" "$HEAD" -- 'e2e/**/*.spec.ts' | tr '\n' ' ' | sed 's/ $//')
         OTHER=$(git diff --name-only "$BASE" "$HEAD" -- . ':(exclude)e2e/**' | head -1)
         N=$(printf '%s' "$CHANGED" | wc -w | tr -d ' ')

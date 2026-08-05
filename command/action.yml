@@ -1,0 +1,295 @@
+# PR e2e slash commands — /retest, /status, /report, /cancel.
+#
+# WHY THIS IS AN ACTION
+# Same reason as the root action: one copy, versioned, fixable without touching three repos.
+# NOTE the different threat model though: an `issue_comment` workflow always runs from the DEFAULT
+# branch, never from the PR, so this one is NOT subject to merge-ref staleness. A fork PR cannot
+# edit the handler to weaken its own checks — that property is what the security model rests on,
+# and it is why authorization can live here safely.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO
+# It never dispatches the central pipeline itself. /retest recycles the `run-tests` label and lets
+# the existing `pull_request` path run exactly as it always has. Two reasons: there is no second
+# dispatch path to secure, and — the one that bit us — a PR's REQUIRED CHECK only updates when the
+# caller workflow runs. A command that produced a report without refreshing the check would look
+# like it worked while leaving the PR unmergeable.
+
+name: 'IBL PR e2e — slash commands'
+description: 'Handle /retest, /status, /report and /cancel comments on a PR'
+
+inputs:
+  source_repo:
+    description: 'os | lms | web-frontend'
+    required: true
+  pr_number:
+    description: 'PR number (github.event.issue.number)'
+    required: true
+  comment_body:
+    description: 'The comment text (github.event.comment.body)'
+    required: true
+  comment_author:
+    description: 'Login of the commenter (github.event.comment.user.login)'
+    required: true
+  comment_id:
+    description: 'Comment id — used to add a reaction as an ack'
+    required: false
+    default: ''
+  label:
+    description: 'The label whose recycle triggers the e2e workflow'
+    required: false
+    default: 'run-tests'
+  repo_token:
+    description: "Calling repo's GITHUB_TOKEN — labels, comments, reactions, cancelling caller runs"
+    required: true
+  dispatch_token:
+    description: 'PAT with Actions read/write on iblai/iblai-deploy-ops — /status and /cancel'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Parse the command
+      id: parse
+      env:
+        BODY: ${{ inputs.comment_body }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Only the FIRST line is considered, so quoting someone else's comment cannot trigger anything.
+        FIRST=$(printf '%s' "$BODY" | head -1 | tr -d '\r' | sed 's/[[:space:]]*$//')
+        case "$FIRST" in
+          /retest|/retest\ *|/status|/report|/cancel|/help|/e2e-help)
+            echo "cmd=$(printf '%s' "$FIRST" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+            echo "args=$(printf '%s' "$FIRST" | cut -s -d' ' -f2-)" >> "$GITHUB_OUTPUT"
+            echo "match=yes" >> "$GITHUB_OUTPUT"
+            echo "command recognised: $FIRST"
+            ;;
+          *)
+            echo "match=no" >> "$GITHUB_OUTPUT"
+            echo "not a pr-e2e command — ignoring"
+            ;;
+        esac
+    - name: Authorize
+      id: auth
+      if: steps.parse.outputs.match == 'yes'
+      env:
+        GH_TOKEN: ${{ inputs.repo_token }}
+        WHO: ${{ inputs.comment_author }}
+        PR: ${{ inputs.pr_number }}
+      shell: bash
+      run: |
+        set -uo pipefail
+        # Repo COLLABORATOR PERMISSION, not author_association. author_association reports MEMBER for any
+        # org member — including people with no write access here — so gating on it would let a much wider
+        # set of accounts occupy a shared test environment.
+        PERM=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${WHO}/permission" --jq '.permission' 2>/dev/null || echo none)
+        FORK=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" --jq '.head.repo.full_name' 2>/dev/null || echo unknown)
+        echo "commenter=$WHO permission=$PERM head_repo=$FORK"
+
+        OK=no; WHY=""
+        case "$PERM" in admin|write|maintain) OK=yes ;; esac
+        # Mirrors the `gate` job: a fork PR never reaches the shared environments.
+        if [ "$FORK" != "$GITHUB_REPOSITORY" ]; then
+          OK=no; WHY="this is a fork PR — e2e does not run on forks (same rule as the \`gate\` job)"
+        elif [ "$OK" != "yes" ]; then
+          WHY="\`$WHO\` needs **write** access to \`$GITHUB_REPOSITORY\` (has: \`$PERM\`)"
+        fi
+
+        echo "ok=$OK" >> "$GITHUB_OUTPUT"
+        if [ "$OK" != "yes" ]; then
+          echo "authorized=no — $WHY"
+          B=$(printf '%s\n' "🚫 **Not authorized.** ${WHY}" "" "_No test run was started and no environment was touched._")
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$B" >/dev/null 2>&1 || true
+          exit 0
+        fi
+        echo "authorized=yes"
+    - name: Acknowledge
+      if: steps.parse.outputs.match == 'yes' && steps.auth.outputs.ok == 'yes' && inputs.comment_id != ''
+      env:
+        GH_TOKEN: ${{ inputs.repo_token }}
+        CID: ${{ inputs.comment_id }}
+      shell: bash
+      run: |
+        set -uo pipefail
+        # A 👀 within seconds tells the author the command was seen. Without it, the gap between commenting
+        # and a run appearing reads as "nothing happened" — which is what sends people to ask a maintainer,
+        # the exact interruption these commands exist to remove.
+        gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/comments/${CID}/reactions" -f content='eyes' >/dev/null 2>&1 || true
+    - name: Run the command
+      if: steps.parse.outputs.match == 'yes' && steps.auth.outputs.ok == 'yes'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.repo_token }}
+        OPS_TOKEN: ${{ inputs.dispatch_token }}
+        CMD: ${{ steps.parse.outputs.cmd }}
+        ARGS: ${{ steps.parse.outputs.args }}
+        PR: ${{ inputs.pr_number }}
+        WHO: ${{ inputs.comment_author }}
+        SOURCE_REPO: ${{ inputs.source_repo }}
+        LABEL: ${{ inputs.label }}
+      run: |
+        set -uo pipefail
+        OPS=iblai/iblai-deploy-ops
+        say() { gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$1" >/dev/null 2>&1 || true; }
+
+        # Newest central run for this PR, whatever env it landed on. Prefix match that STOPS BEFORE the
+        # env — naming an env in a title match is exactly what caused the 2026-08-04 live-lock.
+        central_run() {
+          GH_TOKEN="$OPS_TOKEN" gh run list -R "$OPS" --workflow=pr-e2e.yml --limit 30 \
+            --json databaseId,status,conclusion,displayTitle,createdAt \
+            --jq "[.[] | select(.displayTitle | startswith(\"PR e2e — ${SOURCE_REPO}#${PR} →\"))] | sort_by(.createdAt) | .[-1] // empty" 2>/dev/null
+        }
+        caller_run() {
+          gh run list -R "$GITHUB_REPOSITORY" --workflow=pr-e2e-tests.yml --limit 30 \
+            --json databaseId,status,conclusion,displayTitle,createdAt \
+            --jq "[.[] | select(.displayTitle | test(\"#${PR} \"))] | sort_by(.createdAt) | .[-1] // empty" 2>/dev/null
+        }
+        # jq rather than an embedded python heredoc: this whole block gets indented into a YAML
+        # block scalar, so a multi-line heredoc arrives with uniform leading whitespace and dies on
+        # IndentationError. `bash -n` does not catch it — it would have failed only at runtime.
+        jfield() { printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // ""' 2>/dev/null || true; }
+
+        # The ONLY trigger path. Remove-then-add fires `labeled`, which pr-e2e-tests.yml listens for.
+        # GitHub's "Re-run jobs" is NOT equivalent — it replays the old merge ref.
+        recycle_label() {
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels/${LABEL}" >/dev/null 2>&1 || true
+          sleep 2
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/labels" -f "labels[]=${LABEL}" >/dev/null 2>&1
+        }
+
+        case "$CMD" in
+          /help|/e2e-help)
+            say "$(printf '%s\n' \
+              "### PR e2e commands" "" \
+              "| command | what it does |" \
+              "|---|---|" \
+              "| \`/retest\` | re-run the **full** suite |" \
+              "| \`/retest <spec>\` | re-run **only** matching spec files — minutes instead of ~45 |" \
+              "| \`/status\` | where this PR is in the queue, and what is running |" \
+              "| \`/report\` | link to the latest report for this PR |" \
+              "| \`/cancel\` | stop this PR's run and free the environment |" "" \
+              "\`<spec>\` matches as a substring, so \`/retest 34\` and \`/retest 34-workflows\` both work." \
+              "Several are allowed: \`/retest 34-workflows 50-chat\`." "" \
+              "Requires **write** access to this repo; fork PRs are not eligible.")"
+            ;;
+
+          /status)
+            C=$(central_run); L=$(caller_run)
+            PEND=$(GH_TOKEN="$OPS_TOKEN" gh run list -R "$OPS" --workflow=pr-e2e.yml --limit 30 \
+                    --json status --jq '[.[] | select(.status=="queued" or .status=="pending")] | length' 2>/dev/null || echo '?')
+            RUN=$(GH_TOKEN="$OPS_TOKEN" gh run list -R "$OPS" --workflow=pr-e2e.yml --limit 30 \
+                    --json status,displayTitle --jq '[.[] | select(.status=="in_progress") | .displayTitle] | join(", ")' 2>/dev/null || echo '?')
+            CID=$(jfield "$C" databaseId); CST=$(jfield "$C" status); CCO=$(jfield "$C" conclusion)
+            LST=$(jfield "$L" status);     LCO=$(jfield "$L" conclusion)
+            if [ -n "$CID" ]; then
+              MINE="\`${CST}/${CCO:--}\` — [central run ${CID}](https://github.com/iblai/iblai-deploy-ops/actions/runs/${CID})"
+            else
+              MINE="no central run yet"
+            fi
+            say "$(printf '%s\n' \
+              "### Status — #${PR}" "" \
+              "- **this PR's central run:** ${MINE}" \
+              "- **this PR's caller run:** \`${LST:-none}/${LCO:--}\`" \
+              "- **running now:** ${RUN:-nothing}" \
+              "- **waiting in the queue:** ${PEND}" "" \
+              "Runs serialize per environment, so a wait means the box is busy — not that anything is broken." \
+              "A full mentor suite is ~40–50 min. \`/retest <spec>\` re-runs one file in minutes.")"
+            ;;
+
+          /report)
+            RID=$(jfield "$(central_run)" databaseId)
+            if [ -z "$RID" ]; then
+              say "No central run found for this PR yet. Add the \`${LABEL}\` label or comment \`/retest\` to start one."
+            else
+              BASE="https://tests.iblai.app/runs/pr-${SOURCE_REPO}-${PR}-${RID}"
+              FOUND=""
+              for P in mentor skills; do
+                curl -sfI --max-time 15 "${BASE}/${P}/index.html" >/dev/null 2>&1 || continue
+                V=$(curl -sf --max-time 20 "${BASE}/${P}/summary.json" 2>/dev/null \
+              | jq -r '"\(.verdict // "?") — \(.totals.passed // "?") passed / \(.totals.failed // "?") failed / \(.totals.flaky // "?") flaky"' 2>/dev/null || echo "report available")
+                FOUND="${FOUND}- **${P}:** [report](${BASE}/${P}/index.html) — ${V}"$'\n'
+              done
+              if [ -n "$FOUND" ]; then
+                say "$(printf '%s\n' "### Latest report — #${PR}" "" "${FOUND}" \
+                  "_From [central run ${RID}](https://github.com/iblai/iblai-deploy-ops/actions/runs/${RID})._")"
+              else
+                say "A central run exists ([${RID}](https://github.com/iblai/iblai-deploy-ops/actions/runs/${RID})) but no report is published yet — it is probably still running. Try \`/status\`."
+              fi
+            fi
+            ;;
+
+          /cancel)
+            C=$(central_run); L=$(caller_run); DID=""
+            CST=$(jfield "$C" status); LST=$(jfield "$L" status)
+            case "$LST" in queued|pending|in_progress)
+              LID=$(jfield "$L" databaseId)
+              gh run cancel "$LID" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && DID="${DID}- caller run \`${LID}\` cancelled"$'\n' ;;
+            esac
+            case "$CST" in queued|pending|in_progress)
+              CID=$(jfield "$C" databaseId)
+              GH_TOKEN="$OPS_TOKEN" gh run cancel "$CID" -R "$OPS" >/dev/null 2>&1 && DID="${DID}- central run [\`${CID}\`](https://github.com/iblai/iblai-deploy-ops/actions/runs/${CID}) cancelled"$'\n' ;;
+            esac
+            if [ -n "$DID" ]; then
+              say "$(printf '%s\n' "### Cancelled — requested by @${WHO}" "" "${DID}" \
+                "⚠️ **A cancel does not always stop work already running on the box.** If the suite container" \
+                "had started it can keep going and hold the environment lock. If the next run stays queued for" \
+                "more than a few minutes, tell a maintainer — the container needs killing on the runner.")"
+            else
+              say "Nothing to cancel — no queued or running e2e for this PR."
+            fi
+            ;;
+
+          /retest)
+            # Resolve the argument to real spec paths. Substring match, because nobody remembers
+            # `e2e/journeys/34-workflows.spec.ts` — they remember "34".
+            MODE=full; SPECS=""
+            if [ -n "${ARGS:-}" ] && [ "$ARGS" != "full" ]; then
+              ALL=$(gh api "repos/${GITHUB_REPOSITORY}/git/trees/HEAD?recursive=1" \
+                     --jq '.tree[].path | select(test("^e2e/.*\\.spec\\.ts$"))' 2>/dev/null || true)
+              if [ -z "$ALL" ]; then
+                say "⚠️ Could not list spec files, so \`/retest ${ARGS}\` cannot be resolved. Nothing was started — use \`/retest\` for the full suite."
+                exit 0
+              fi
+              MISS=""
+              for TOK in $ARGS; do
+                HIT=$(printf '%s\n' "$ALL" | grep -F -- "$TOK" || true)
+                if [ -z "$HIT" ]; then MISS="$MISS $TOK"; else SPECS="$SPECS $HIT"; fi
+              done
+              if [ -n "$MISS" ]; then
+                say "$(printf '%s\n' "❌ No spec file matches:${MISS}" "" \
+                  "Nothing was started. \`/retest\` with no argument runs the full suite.")"
+                exit 0
+              fi
+              SPECS=$(printf '%s' "$SPECS" | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ *$//')
+              MODE=selective
+            fi
+
+            # The marker the root action reads when it starts. Authored by github-actions[bot] and pinned
+            # to the CURRENT head sha, so a new push invalidates it — a selective request can never
+            # silently narrow a later commit's test run.
+            HEAD=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" --jq '.head.sha' 2>/dev/null || echo '')
+            PAYLOAD=$(jq -nc --arg mode "$MODE" --arg specs "$SPECS" --arg head_sha "$HEAD" --arg by "$WHO" \
+                    '{mode:$mode, specs:$specs, head_sha:$head_sha, by:$by}')
+            MBODY=$(printf '%s\n' "<!-- pr-e2e-cmd -->" "$PAYLOAD")
+            EXIST=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+                      --jq '[.[] | select(.body | startswith("<!-- pr-e2e-cmd -->"))] | .[-1].id // empty' 2>/dev/null || true)
+            if [ -n "$EXIST" ]; then
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXIST}" -f body="$MBODY" >/dev/null 2>&1 || true
+            else
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" -f body="$MBODY" >/dev/null 2>&1 || true
+            fi
+
+            recycle_label
+            if [ "$MODE" = selective ]; then
+              N=$(printf '%s' "$SPECS" | wc -w | tr -d ' ')
+              say "$(printf '%s\n' "### Re-running ${N} spec file(s) — requested by @${WHO}" "" \
+                '```' "$(printf '%s' "$SPECS" | tr ' ' '\n')" '```' \
+                "A selective run is typically **a few minutes** instead of ~45. \`/status\` for progress." "" \
+                "⚠️ This proves only these files. Push a commit, or \`/retest\` with no argument, for the full suite before merging.")"
+            else
+              say "$(printf '%s\n' "### Re-running the full suite — requested by @${WHO}" "" \
+                "Expect ~40–50 min plus any queue wait. \`/status\` for progress, \`/cancel\` to stop it." "" \
+                "Next time: \`/retest <spec>\` re-runs a single file in minutes.")"
+            fi
+            ;;
+        esac
