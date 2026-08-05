@@ -338,6 +338,7 @@ runs:
         RUN_ID: ${{ steps.dispatch.outputs.run_id }}
         PR: ${{ inputs.pr_number }}
         DISPATCH_CONCLUSION: ${{ steps.dispatch.outputs.conclusion }}
+        HEAD_SHA: ${{ inputs.head_sha }}
       shell: bash
       run: |
         set -uo pipefail
@@ -373,6 +374,12 @@ runs:
         icon = {"success": "OK", "failure": "FAILED", "cancelled": "NOT RUN"}.get(v, v)
         rep  = d.get("report_url") or ""
         rows = [("result", f"**{icon}**")]
+        rid = os.environ.get("RUN_ID", "")
+        if rid:
+            rows.append(("central run", f"[`{rid}`](https://github.com/iblai/iblai-deploy-ops/actions/runs/{rid})"))
+        hsha = os.environ.get("HEAD_SHA", "")
+        if hsha:
+            rows.append(("commit", f"`{hsha[:8]}`"))
         if d.get("platform"):
             rows.append(("suite", f'`{d["platform"]}` - mode `{d.get("mode","?")}` - env `{d.get("target_env","?")}`'))
         if d.get("baseline"):
@@ -381,7 +388,16 @@ runs:
         for label, key in (("failed", "failed"), ("new failures", "new_failures")):
             if d.get(key) not in (None, ""):
                 rows.append((label, f'`{d[key]}`'))
-        out = ["<!-- pr-e2e-report -->", f"### PR E2E - {icon}", ""]
+        # Two comment identities, deliberately:
+        #   * a run that PRODUCED a report posts its own comment and is never edited, so the PR
+        #     conversation keeps a run-by-run history of what was tested and when;
+        #   * a run that produced NOTHING updates one sticky notice instead — a label recycle fires
+        #     two events, so cancelled dispatches would otherwise spam the thread.
+        # This also kills the overwrite hazard structurally rather than by carrying text forward:
+        # nothing can bury a real verdict if real verdicts are never edited.
+        marker = "<!-- pr-e2e-report -->" if rep else "<!-- pr-e2e-norun -->"
+        pathlib.Path("/tmp/marker").write_text(marker)
+        out = [marker, f"### PR E2E - {icon}", ""]
         if rep:
             out += [f"**[Full report, traces and screenshots]({rep})**", ""]
         out += ["| | |", "|---|---|"] + [f"| {k} | {val} |" for k, val in rows]
@@ -391,7 +407,8 @@ runs:
                         " suite — usually because another PR's run took the shared environment, a newer"
                         " commit/label superseded this one, or it was abandoned before completing."
                         " **This says nothing about your code.**", "",
-                    "Re-trigger it yourself: **remove the `run-tests` label and add it back**."
+                    "Re-trigger it yourself: comment **`/retest`** (or `/retest <spec>` to re-run"
+                    " a single file in minutes). `/status` shows the queue."
                     " (Avoid *Re-run jobs* — that replays the old merge ref instead of"
                     " recomputing it against current `main`.)"]
             # Preserve the last known-good report so an eviction cannot bury a real result.
@@ -405,10 +422,15 @@ runs:
         cat /tmp/body.md >> "$GITHUB_STEP_SUMMARY"
         cat /tmp/body.md
 
-        # Sticky comment: update the existing one so re-runs do not spam the PR.
         python3 -c "import json;print(json.dumps({'body':open('/tmp/body.md').read()}))" > /tmp/payload.json
-        CID=$(GH_TOKEN="$REPO_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
-                --jq '[.[] | select(.body | startswith("<!-- pr-e2e-report -->"))] | .[-1].id // empty' 2>/dev/null || true)
+        MARKER=$(cat /tmp/marker 2>/dev/null || echo "<!-- pr-e2e-norun -->")
+        if [ "$MARKER" = "<!-- pr-e2e-report -->" ]; then
+          CID=""   # a real result always gets its OWN comment — history, and nothing overwritten
+        else
+          # no result: reuse the single sticky notice rather than spam the thread
+          CID=$(GH_TOKEN="$REPO_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+                  --jq '[.[] | select(.body | startswith("<!-- pr-e2e-norun -->"))] | .[-1].id // empty' 2>/dev/null || true)
+        fi
         if [ -n "$CID" ]; then
           GH_TOKEN="$REPO_TOKEN" gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${CID}" \
             --input /tmp/payload.json >/dev/null && echo "updated PR comment $CID"
