@@ -220,7 +220,15 @@ runs:
           return 1
         }
 
-        echo "executing $CMD for #${PR} (source_repo=$SOURCE_REPO, requested by $WHO)"
+        # Each repo drives a different suite. Hardcoding "mentor" told lms and web-frontend users
+        # the wrong thing about their own runs.
+        case "$SOURCE_REPO" in
+          os)           SUITE=mentor ;;
+          lms)          SUITE=skills ;;
+          web-frontend) SUITE=auth   ;;
+          *)            SUITE="$SOURCE_REPO" ;;
+        esac
+        echo "executing $CMD for #${PR} (source_repo=$SOURCE_REPO, suite=$SUITE, requested by $WHO)"
         case "$CMD" in
           /help|/e2e-help)
             say "$(printf '%s\n' \
@@ -257,7 +265,7 @@ runs:
               "- **running now:** ${RUN:-nothing}" \
               "- **waiting in the queue:** ${PEND}" "" \
               "Runs serialize per environment, so a wait means the box is busy — not that anything is broken." \
-              "A full mentor suite is ~40–50 min. \`/retest <spec>\` re-runs one file in minutes.")"
+              "A full ${SUITE} suite is ~40–50 min. \`/retest <spec>\` re-runs one file in minutes.")"
             ;;
 
           /report)
