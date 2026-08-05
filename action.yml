@@ -76,18 +76,26 @@ runs:
         #     leaving the rest of the suite untested while the required check went green.
         if [ -z "${MODE_IN:-}" ] || [ "$MODE_IN" = auto ]; then
           M=$(GH_TOKEN="$REPO_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
-                --jq '[.[] | select(.user.login=="github-actions[bot]") | select(.body | startswith("<!-- pr-e2e-cmd -->"))] | .[-1].body // empty' 2>/dev/null || true)
+                --jq '[.[] | select(.user.login=="github-actions[bot]") | select(.body | startswith("<!-- pr-e2e-cmd"))] | .[-1].body // empty' 2>/dev/null || true)
           if [ -n "$M" ]; then
-            J=$(printf '%s' "$M" | tail -n +2)
+            # accepts both the hidden one-line form and the older two-line one
+            J=$(printf '%s' "$M" | sed -e 's/^<!-- pr-e2e-cmd //' -e 's/ *-->$//' | tail -n 1)
             C_MODE=$(printf '%s' "$J" | jq -r '.mode // ""' 2>/dev/null || echo "")
             C_SPECS=$(printf '%s' "$J" | jq -r '.specs // ""' 2>/dev/null || echo "")
             C_SHA=$(printf '%s' "$J" | jq -r '.head_sha // ""' 2>/dev/null || echo "")
             C_BY=$(printf '%s' "$J" | jq -r '.by // ""' 2>/dev/null || echo "")
-            if [ -n "$C_MODE" ] && [ "$C_SHA" = "$HEAD" ]; then
+            C_AT=$(printf '%s' "$J" | jq -r '.at // 0' 2>/dev/null || echo 0)
+            AGE=$(( $(date +%s) - ${C_AT:-0} ))
+            # 4h window. A /retest is answered within minutes even behind a full queue, so anything
+            # older is a leftover rather than an intent — and a leftover that still matches the
+            # commit would narrow a manual re-run nobody asked to narrow.
+            if [ -n "$C_MODE" ] && [ "$C_SHA" = "$HEAD" ] && [ "${C_AT:-0}" -gt 0 ] && [ "$AGE" -lt 14400 ]; then
               MODE_IN="$C_MODE"; SPECS_IN="$C_SPECS"
               echo "::notice::/retest by ${C_BY:-?} -> mode=$MODE_IN specs=${SPECS_IN:-<all>}"
-            elif [ -n "$C_SHA" ]; then
+            elif [ -n "$C_SHA" ] && [ "$C_SHA" != "$HEAD" ]; then
               echo "::notice::ignoring a /retest marker from an older commit (${C_SHA:0:8} != ${HEAD:0:8}) - running normal detection"
+            elif [ -n "$C_MODE" ]; then
+              echo "::notice::ignoring a /retest marker ${AGE}s old (>4h) - running normal detection"
             fi
           fi
         fi

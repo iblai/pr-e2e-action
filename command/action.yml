@@ -354,11 +354,17 @@ runs:
             # to the CURRENT head sha, so a new push invalidates it — a selective request can never
             # silently narrow a later commit's test run.
             HEAD=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}" --jq '.head.sha' 2>/dev/null || echo '')
+            # `at` bounds how long this request can apply. Without it the marker lives as long as
+            # the commit does, so a MANUAL label recycle hours later would silently inherit the
+            # narrow scope — a green check having run 3 tests when the person expected 621.
             PAYLOAD=$(jq -nc --arg mode "$MODE" --arg specs "$SPECS" --arg head_sha "$HEAD" --arg by "$WHO" \
-                    '{mode:$mode, specs:$specs, head_sha:$head_sha, by:$by}')
-            MBODY=$(printf '%s\n' "<!-- pr-e2e-cmd -->" "$PAYLOAD")
+                    --argjson at "$(date +%s)" \
+                    '{mode:$mode, specs:$specs, head_sha:$head_sha, by:$by, at:$at}')
+            # ONE html comment so nothing renders. The old form put the marker on line 1 and the
+            # JSON on line 2, leaving raw JSON visible in the PR conversation.
+            MBODY="<!-- pr-e2e-cmd ${PAYLOAD} -->"
             EXIST=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
-                      --jq '[.[] | select(.body | startswith("<!-- pr-e2e-cmd -->"))] | .[-1].id // empty' 2>/dev/null || true)
+                      --jq '[.[] | select(.body | startswith("<!-- pr-e2e-cmd"))] | .[-1].id // empty' 2>/dev/null || true)
             if [ -n "$EXIST" ]; then
               gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXIST}" -f body="$MBODY" >/dev/null 2>&1 || true
             else
