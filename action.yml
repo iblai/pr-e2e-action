@@ -105,18 +105,25 @@ runs:
         # Only spec files touched (and not many) -> run just those for fast feedback.
         # Any app-source change -> full suite, since behaviour may have moved anywhere.
         if [ "$MODE_IN" = "selective" ] && [ -n "$SPECS_IN" ]; then
-          echo "mode=selective" >> "$GITHUB_OUTPUT"; echo "specs=$SPECS_IN" >> "$GITHUB_OUTPUT"
-          echo "selective (explicit override): $SPECS_IN"
+          MODE=selective; SPECS="$SPECS_IN"
+          echo "selective (explicit override): $SPECS"
         elif [ "$MODE_IN" = "full" ]; then
-          echo "mode=full" >> "$GITHUB_OUTPUT"; echo "specs=" >> "$GITHUB_OUTPUT"
+          MODE=full; SPECS=""
           echo "full suite (explicit override)"
         elif [ -n "$CHANGED" ] && [ -z "$OTHER" ] && [ "$N" -le 5 ]; then
-          echo "mode=selective" >> "$GITHUB_OUTPUT"; echo "specs=$CHANGED" >> "$GITHUB_OUTPUT"
-          echo "selective: $CHANGED"
+          MODE=selective; SPECS="$CHANGED"
+          echo "selective: $SPECS"
         else
-          echo "mode=full" >> "$GITHUB_OUTPUT"; echo "specs=" >> "$GITHUB_OUTPUT"
+          MODE=full; SPECS=""
           echo "full suite (changed specs=$N, non-spec changes=${OTHER:-none})"
         fi
+        # The spec list is made of file names the PR chose. No real spec needs a character
+        # outside this set, so refuse anything else before the list reaches another command.
+        if printf '%s' "$SPECS" | LC_ALL=C grep -q '[^A-Za-z0-9._/ -]'; then
+          echo "::error::refusing to dispatch: a spec path contains unexpected characters"
+          exit 1
+        fi
+        echo "mode=$MODE" >> "$GITHUB_OUTPUT"; echo "specs=$SPECS" >> "$GITHUB_OUTPUT"
 
     - name: Dispatch e2e and wait for the result
       id: dispatch
@@ -124,6 +131,11 @@ runs:
         SOURCE_REPO: ${{ inputs.source_repo }}
         GH_TOKEN: ${{ inputs.dispatch_token }}
         PR: ${{ inputs.pr_number }}
+        MERGE_SHA: ${{ inputs.merge_sha }}
+        HEAD_SHA: ${{ inputs.head_sha }}
+        APP_IMAGE: ${{ inputs.app_image }}
+        E2E_MODE: ${{ steps.specs.outputs.mode }}
+        E2E_SPECS: ${{ steps.specs.outputs.specs }}
       shell: bash
       run: |
         set -uo pipefail
@@ -193,13 +205,13 @@ runs:
           # github.sha on a pull_request IS the merge commit — the same ref actions/checkout used to
           # build the app image, so the specs and the app code come from one commit.
           gh workflow run pr-e2e.yml -R "$OPS" --ref main \
-            -f source_repo=${SOURCE_REPO} \
+            -f source_repo="$SOURCE_REPO" \
             -f pr_number="$PR" \
-            -f merge_sha='${{ inputs.merge_sha }}' \
-            -f head_sha='${{ inputs.head_sha }}' \
-            -f app_image='${{ inputs.app_image }}' \
-            -f mode='${{ steps.specs.outputs.mode }}' \
-            -f specs='${{ steps.specs.outputs.specs }}' || return 1
+            -f merge_sha="$MERGE_SHA" \
+            -f head_sha="$HEAD_SHA" \
+            -f app_image="$APP_IMAGE" \
+            -f mode="$E2E_MODE" \
+            -f specs="$E2E_SPECS" || return 1
           for i in $(seq 1 30); do
             sleep 5
             id=$(gh run list -R "$OPS" --workflow=pr-e2e.yml -L 1 --json databaseId --jq '.[0].databaseId // 0')
@@ -449,11 +461,12 @@ runs:
 
     - name: Gate on the e2e result
       if: always()
+      env:
+        CONCLUSION: ${{ steps.dispatch.outputs.conclusion }}
       shell: bash
       run: |
-        C="${{ steps.dispatch.outputs.conclusion }}"
-        echo "e2e conclusion: ${C:-<none>}"
-        [ "$C" = "success" ]
+        echo "e2e conclusion: ${CONCLUSION:-<none>}"
+        [ "$CONCLUSION" = "success" ]
 # ============================================================
 # SUMMARY
 # ============================================================

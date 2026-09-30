@@ -48,7 +48,7 @@ applies to every PR immediately — including PRs opened months ago, with no reb
 | `base_sha` | yes | — | used to diff changed specs |
 | `app_image` | yes | — | SPA image built from `merge_sha` |
 | `mode` | no | `auto` | `auto` \| `full` \| `selective` |
-| `specs` | no | `''` | space-separated spec files; with `mode=selective` this wins over auto-detection |
+| `specs` | no | `''` | space-separated spec files; with `mode=selective` this wins over auto-detection. Paths may only contain letters, digits, `.` `_` `/` `-` and spaces; anything else stops the dispatch |
 | `dispatch_token` | yes | — | PAT with `Actions: write` on `iblai/iblai-deploy-ops` |
 | `repo_token` | yes | — | `GITHUB_TOKEN`; only used to write the PR's sticky comment |
 
