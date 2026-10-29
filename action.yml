@@ -147,7 +147,7 @@ runs:
           ids=$(MYTITLE="$MYTITLE" gh run list -R "$OPS" --workflow=pr-e2e.yml --limit 40 \
                   --json databaseId,status,displayTitle \
                   --jq '[.[] | select((.status=="queued" or .status=="pending" or .status=="in_progress")
-                                      and .displayTitle==env.MYTITLE) | .databaseId] | .[]' 2>/dev/null) || ids=""
+                                      and (.displayTitle | startswith(env.MYTITLE))) | .databaseId] | .[]' 2>/dev/null) || ids=""
           for id in $ids; do
             [ "$id" = "${RUN_ID:-}" ] && continue
             echo "::warning::cancelling orphaned central run ${id} for this PR — superseded by this caller"
@@ -187,23 +187,36 @@ runs:
           echo "::error::no free dispatch slot after 2h"; return 1
         }
 
+        # Only ever adopt THIS PR's run. Taking "the newest run" picked up another PR's run when two
+        # dispatched seconds apart, and published that PR's result here (lms#288 got lms#289's
+        # FAILED on 2026-10-28; the same race can publish someone else's PASS).
         do_dispatch() {
-          local before id i
+          local before id i resp
           before=$(gh run list -R "$OPS" --workflow=pr-e2e.yml -L 1 --json databaseId --jq '.[0].databaseId // 0')
           # github.sha on a pull_request IS the merge commit — the same ref actions/checkout used to
           # build the app image, so the specs and the app code come from one commit.
-          gh workflow run pr-e2e.yml -R "$OPS" --ref main \
-            -f source_repo=${SOURCE_REPO} \
-            -f pr_number="$PR" \
-            -f merge_sha='${{ inputs.merge_sha }}' \
-            -f head_sha='${{ inputs.head_sha }}' \
-            -f app_image='${{ inputs.app_image }}' \
-            -f mode='${{ steps.specs.outputs.mode }}' \
-            -f specs='${{ steps.specs.outputs.specs }}' || return 1
+          # API version 2026-03-10 answers the dispatch with the id of the run it created.
+          resp=$(gh api -X POST "repos/$OPS/actions/workflows/pr-e2e.yml/dispatches" \
+                   -H "X-GitHub-Api-Version: 2026-03-10" \
+                   -f ref=main \
+                   -f "inputs[source_repo]=${SOURCE_REPO}" \
+                   -f "inputs[pr_number]=${PR}" \
+                   -f 'inputs[merge_sha]=${{ inputs.merge_sha }}' \
+                   -f 'inputs[head_sha]=${{ inputs.head_sha }}' \
+                   -f 'inputs[app_image]=${{ inputs.app_image }}' \
+                   -f 'inputs[mode]=${{ steps.specs.outputs.mode }}' \
+                   -f 'inputs[specs]=${{ steps.specs.outputs.specs }}') || return 1
+          id=$(printf '%s' "$resp" | grep -oE '"workflow_run_id": *[0-9]+' | grep -oE '[0-9]+$' || true)
+          if [ -n "$id" ]; then RUN_ID="$id"; return 0; fi
+          # No id in the answer (older API: 204, no body): this PR's run, created after the dispatch.
           for i in $(seq 1 30); do
             sleep 5
-            id=$(gh run list -R "$OPS" --workflow=pr-e2e.yml -L 1 --json databaseId --jq '.[0].databaseId // 0')
-            if [ "$id" != "$before" ] && [ "$id" != "0" ]; then RUN_ID="$id"; return 0; fi
+            id=$(MYTITLE="$MYTITLE" BEFORE="$before" gh run list -R "$OPS" --workflow=pr-e2e.yml --limit 20 \
+                   --json databaseId,displayTitle \
+                   --jq '[.[] | select((.displayTitle | startswith(env.MYTITLE))
+                                       and .databaseId > (env.BEFORE | tonumber))] | .[0].databaseId // 0' \
+                   2>/dev/null || echo 0)
+            if [ "$id" != "0" ]; then RUN_ID="$id"; return 0; fi
           done
           return 1
         }
