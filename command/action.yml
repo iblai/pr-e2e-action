@@ -266,6 +266,13 @@ runs:
               STAGE=$(GH_TOKEN="$OPS_TOKEN" gh api "repos/$OPS/actions/runs/$CID/jobs" \
                         --jq '[.jobs[] | select(.status=="in_progress") | .name] | join(", ")' 2>/dev/null || true)
               NOW="**Running now:** ${STAGE:-waiting for the test environment}"
+              # The suite's live counts and most common cause so far, published by the central run.
+              if curl -fsS --max-time 10 -o "$RUNNER_TEMP/live.json" \
+                   "https://tests.iblai.app/runs/pr-${SOURCE_REPO}-${PR}-${CID}/${SUITE}/live.json" 2>/dev/null; then
+                LIVE=$(python3 "$GITHUB_ACTION_PATH/../render.py" --live "$RUNNER_TEMP/live.json" 2>/dev/null \
+                         | sed 's/^e2e progress: //' || true)
+                [ -n "$LIVE" ] && NOW="${NOW} — ${LIVE}"
+              fi
             else
               NOW="**No run yet.** Add the \`${LABEL}\` label or comment \`/retest\` to start one."
             fi

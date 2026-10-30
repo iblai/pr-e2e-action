@@ -123,6 +123,7 @@ runs:
       env:
         SOURCE_REPO: ${{ inputs.source_repo }}
         GH_TOKEN: ${{ inputs.dispatch_token }}
+        REPO_TOKEN: ${{ inputs.repo_token }}
         PR: ${{ inputs.pr_number }}
       shell: bash
       run: |
@@ -221,6 +222,29 @@ runs:
           return 1
         }
 
+        # While the suite runs, the central run publishes live.json on tests.iblai.app: counts and the
+        # top browser-side cause so far. Logged here; once one crash or browser error has hit 10 tests
+        # the PR gets ONE early-warning comment, and the run keeps going. Never fails the step.
+        case "$SOURCE_REPO" in
+          os) SUITE=mentor ;; lms) SUITE=skills ;; web-frontend) SUITE=auth ;; *) SUITE="$SOURCE_REPO" ;;
+        esac
+        WARNED=""
+        check_live() {
+          local f="$RUNNER_TEMP/pr-e2e-live.json" w="$RUNNER_TEMP/pr-e2e-early.md"
+          curl -fsS --max-time 10 -o "$f" \
+            "https://tests.iblai.app/runs/pr-${SOURCE_REPO}-${PR}-${RUN_ID}/${SUITE}/live.json" 2>/dev/null || return 0
+          : > "$w"
+          python3 "$GITHUB_ACTION_PATH/render.py" --live "$f" --out-warning "$w" 2>/dev/null \
+            | sed "s/^/[$(date -u +%H:%M:%SZ)] /" || true
+          if [ -z "$WARNED" ] && [ -s "$w" ]; then
+            python3 -c "import json,sys;print(json.dumps({'body':open(sys.argv[1]).read()}))" "$w" > "$w.json" \
+              && GH_TOKEN="$REPO_TOKEN" gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+                   --input "$w.json" >/dev/null 2>&1 \
+              && { WARNED=1; echo "posted the early-warning comment"; } || true
+          fi
+          return 0
+        }
+
         # Returns: 0 = completed (CONCLUSION set) · 1 = timed out · 2 = EVICTED (retryable)
         poll_run() {
           local i started=0 idle_since="" any_job=0 exec_ticks=0 last="" phases active busy s now
@@ -249,6 +273,7 @@ runs:
               fi
             else
               exec_ticks=$((exec_ticks + 1))
+              [ $((exec_ticks % 4)) -eq 0 ] && check_live
               if [ "$exec_ticks" -ge 240 ]; then
                 CONCLUSION=timed_out
                 echo "::error::the run has been EXECUTING for 2h without finishing. https://github.com/$OPS/actions/runs/${RUN_ID}"

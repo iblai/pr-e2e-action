@@ -156,6 +156,7 @@ def causes_block(v, deps):
     causes = v.get("causes") or []
     new = [c for c in causes if not c.get("known")]
     known = [c for c in causes if c.get("known")]
+    own = [c for c in new if not c.get("seen_elsewhere")]
     lines = []
     if new:
         lines += ["", "| Tests | What went wrong | Example |", "|---:|---|---|"]
@@ -165,12 +166,14 @@ def causes_block(v, deps):
             links = " · ".join(f"[{label}]({ex[k]})" for k, label in (("screenshot_url", "screenshot"), ("trace_url", "trace"))
                                if ex.get(k))
             where = f" at {code(c['where'])}" if c.get("where") else ""
+            if c.get("seen_elsewhere"):
+                where += f" — also failing on {cell(', '.join(c['seen_elsewhere']))}, probably not yours"
             lines.append(f"| {c.get('count', 0)} | {KIND_LABEL.get(c.get('kind'), 'Failed')}: {code(c.get('text', '')).replace('|', chr(92) + '|')}"
                          f"{where} | {test}{' · ' + links if links else ''} |")
-        top = new[0]
+        top = own[0] if own else new[0]
         if top.get("snippet"):
             lines += ["", "Code at that spot:"] + block([top["snippet"]])
-        if top.get("kind") in ("crash", "js_error") and deps:
+        if own and top.get("kind") in ("crash", "js_error") and deps:
             change = ", ".join(f"{code(n)} {code(a)} → {code(b)}" for n, a, b in deps[:3])
             lines += ["", f"**Hint:** this PR changes {change}. A crash right after a dependency bump usually comes "
                           "from the new version."]
@@ -178,6 +181,36 @@ def causes_block(v, deps):
         lines += ["", "Probably not from your PR (known issues): "
                   + "; ".join(f"{c.get('count', 0)} × {neutral(c.get('plain', ''))}" for c in known)]
     return lines
+
+
+EARLY = 10  # tests sharing one crash or browser error before the PR is warned
+
+
+def progress_line(live):
+    """One line for the caller's log while the suite runs."""
+    line = f"e2e progress: {live.get('passed', 0)} passed, {live.get('failed', 0)} failed so far"
+    top = (live.get("causes") or [None])[0]
+    if top:
+        line += f"; most common: {KIND_LABEL.get(top.get('kind'), top.get('kind'))} x{top.get('count')} {code(top.get('text', '')[:80])}"
+    return line
+
+
+def early_warning(live, threshold=EARLY):
+    """The one comment posted mid-run when a crash or browser error has already hit `threshold` tests."""
+    top = (live.get("causes") or [None])[0]
+    if not top or top.get("kind") not in ("crash", "js_error") or (top.get("count") or 0) < threshold:
+        return None
+    what = "crashes" if top["kind"] == "crash" else "throws a browser error"
+    return "\n".join([
+        "<!-- pr-e2e-early -->",
+        "### ⚠️ PR E2E early warning: your build looks broken",
+        "",
+        f"**{top['count']} tests so far: your build {what}: {code(top.get('text', ''))}**",
+        "",
+        f"The run keeps going ({live.get('passed', 0)} passed, {live.get('failed', 0)} failed so far). The full result, "
+        "with every cause, a screenshot and a trace, is posted when it finishes. You can fix and push now; the push "
+        "starts a new run.",
+    ]) + "\n"
 
 
 def render(v, ctx):
@@ -227,11 +260,27 @@ def render(v, ctx):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--result", required=True, help="pr-e2e-result.json (may be missing)")
-    ap.add_argument("--out-body", required=True)
-    ap.add_argument("--out-headline", required=True)
+    ap.add_argument("--result", help="pr-e2e-result.json (may be missing)")
+    ap.add_argument("--out-body")
+    ap.add_argument("--out-headline")
+    ap.add_argument("--live", help="progress mode: the run's live.json; prints a progress line")
+    ap.add_argument("--out-warning", help="progress mode: write the early-warning comment here when it is due")
     ap.add_argument("--patch", default="", help="the PR's package.json diff, for the dependency-bump hint")
     args = ap.parse_args(argv)
+    if args.live:
+        try:
+            with open(args.live, encoding="utf-8") as f:
+                live = json.load(f)
+        except (OSError, ValueError):
+            return 0
+        print(progress_line(live))
+        warning = early_warning(live)
+        if warning and args.out_warning:
+            with open(args.out_warning, "w", encoding="utf-8") as f:
+                f.write(warning)
+        return 0
+    if not (args.result and args.out_body and args.out_headline):
+        ap.error("--result, --out-body and --out-headline are required (or --live)")
     try:
         with open(args.result, encoding="utf-8") as f:
             result = json.load(f)
