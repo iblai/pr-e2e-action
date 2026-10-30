@@ -182,6 +182,8 @@ runs:
         # re-indentation without care. (An indented heredoc would also work — YAML strips the block
         # indentation — but one-liners are harder to break.)
         jfield() { printf '%s' "$1" | jq -r --arg k "$2" '.[$k] // ""' 2>/dev/null || true; }
+        # Pipeline text quoted in a reply must not mention anyone or link an issue on a public PR.
+        NEUTRAL='gsub("@"; "@\u200b") | gsub("#(?<d>[0-9])"; "#\u200b\(.d)")'
 
         # The ONLY trigger path. Remove-then-add fires `labeled`, which pr-e2e-tests.yml listens for.
         # GitHub's "Re-run jobs" is NOT equivalent — it replays the old merge ref.
@@ -253,13 +255,28 @@ runs:
                     --json status,displayTitle --jq '[.[] | select(.status=="in_progress") | .displayTitle] | join(", ")' 2>/dev/null || echo '?')
             CID=$(jfield "$C" databaseId); CST=$(jfield "$C" status); CCO=$(jfield "$C" conclusion)
             LST=$(jfield "$L" status);     LCO=$(jfield "$L" conclusion)
+            # In words, before any run ids: what this PR's run is doing now, or how it ended.
+            NOW=""
+            if [ -n "$CID" ] && [ "$CST" = "completed" ]; then
+              if GH_TOKEN="$OPS_TOKEN" gh run download "$CID" -R "$OPS" -n pr-e2e-result -D "$RUNNER_TEMP/st" >/dev/null 2>&1; then
+                NOW=$(jq -r "(.headline // empty) | ${NEUTRAL}" "$RUNNER_TEMP/st/pr-e2e-result.json" 2>/dev/null || true)
+              fi
+              NOW="**Finished:** ${NOW:-${CCO}}"
+            elif [ -n "$CID" ]; then
+              STAGE=$(GH_TOKEN="$OPS_TOKEN" gh api "repos/$OPS/actions/runs/$CID/jobs" \
+                        --jq '[.jobs[] | select(.status=="in_progress") | .name] | join(", ")' 2>/dev/null || true)
+              NOW="**Running now:** ${STAGE:-waiting for the test environment}"
+            else
+              NOW="**No run yet.** Add the \`${LABEL}\` label or comment \`/retest\` to start one."
+            fi
             if [ -n "$CID" ]; then
-              MINE="\`${CST}/${CCO:--}\` — [central run ${CID}](https://github.com/iblai/iblai-deploy-ops/actions/runs/${CID})"
+              MINE="\`${CST}/${CCO:--}\` — [central run ${CID}](https://github.com/iblai/iblai-deploy-ops/actions/runs/${CID}) (maintainers)"
             else
               MINE="no central run yet"
             fi
             say "$(printf '%s\n' \
               "### Status — #${PR}" "" \
+              "${NOW}" "" \
               "- **this PR's central run:** ${MINE}" \
               "- **this PR's caller run:** \`${LST:-none}/${LCO:--}\`" \
               "- **running now:** ${RUN:-nothing}" \
@@ -278,10 +295,13 @@ runs:
               # "no report is published yet" when the probe failed — which told a user their report
               # did not exist while it sat there returning 200. A network probe from the runner is
               # not evidence about whether a report was produced; the run's own artifact is.
-              REPORT=""; VERD=""
-              if GH_TOKEN="$OPS_TOKEN" gh run download "$RID" -R "$OPS" -n pr-e2e-result -D /tmp/rep >/dev/null 2>&1; then
-                REPORT=$(jq -r '.report_url // ""' /tmp/rep/pr-e2e-result.json 2>/dev/null || echo "")
-                VERD=$(jq -r '"\(.verdict // "?") — \(.failed // "?") failed, \(.new_failures // "?") new"' /tmp/rep/pr-e2e-result.json 2>/dev/null || echo "")
+              REPORT=""; HEAD=""; HAVE=""
+              if GH_TOKEN="$OPS_TOKEN" gh run download "$RID" -R "$OPS" -n pr-e2e-result -D "$RUNNER_TEMP/rep" >/dev/null 2>&1; then
+                HAVE=1
+                REPORT=$(jq -r '.report_url // ""' "$RUNNER_TEMP/rep/pr-e2e-result.json" 2>/dev/null || echo "")
+                # Schema 2 results carry the sentence the PR comment leads with; older ones only counts.
+                HEAD=$(jq -r "(.headline // \"\\(.verdict // \"?\") — \\(.failed // \"?\") failed, \\(.new_failures // \"?\") new\") | ${NEUTRAL}" \
+                         "$RUNNER_TEMP/rep/pr-e2e-result.json" 2>/dev/null || echo "")
                 echo "artifact report_url=${REPORT:-<none>}"
               else
                 echo "no pr-e2e-result artifact on run $RID (still running, or it expired)"
@@ -289,18 +309,16 @@ runs:
 
               if [ -n "$REPORT" ]; then
                 say "$(printf '%s\n' "### Latest report — #${PR}" "" \
-                  "**[Full report, traces and screenshots](${REPORT})**" "" \
-                  "${VERD}" "" \
-                  "_From [central run ${RID}](https://github.com/iblai/iblai-deploy-ops/actions/runs/${RID})._")"
+                  "**${HEAD}**" "" \
+                  "**[Full report, traces and screenshots](${REPORT})**")"
+              elif [ -n "$HAVE" ]; then
+                # The run finished without a report: say why rather than pointing at a URL that 404s.
+                say "$(printf '%s\n' "### Latest run — #${PR}" "" \
+                  "**${HEAD}**" "" \
+                  "It produced no test report. \`/retest\` starts a new run.")"
               else
-                # No artifact yet. Still give the conventional path rather than asserting there is
-                # no report — the run may simply not have finished publishing.
-                BASE="https://tests.iblai.app/runs/pr-${SOURCE_REPO}-${PR}-${RID}"
                 say "$(printf '%s\n' "### Report — #${PR}" "" \
-                  "[Central run ${RID}](https://github.com/iblai/iblai-deploy-ops/actions/runs/${RID}) has not published a result artifact yet — it is probably still running (\`/status\` shows progress)." "" \
-                  "If it has finished, the report is normally at:" \
-                  "- ${BASE}/mentor/index.html" \
-                  "- ${BASE}/skills/index.html")"
+                  "This PR's latest run hasn't finished yet. \`/status\` shows what it's doing.")"
               fi
             fi
             ;;
