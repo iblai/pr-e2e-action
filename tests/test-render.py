@@ -89,6 +89,42 @@ check("a PR build that never starts is the developer's, not 'failed tests'",
 body, head = show({**ECR, "outcome": "cancelled", "owner": "none", "headline": "This run was stopped before it finished."})
 check("a stopped run updates the single sticky notice", (body.splitlines()[0], head["marker"]), ("<!-- pr-e2e-norun -->",) * 2)
 
+# ---- what really broke: the causes table ----------------------------------------------------------
+CRASH = "TypeError: Cannot read properties of undefined (reading 'find')"
+def cause(kind, count, text, known=False, snippet=None):
+    return {"kind": kind, "plain": {"crash": "The app crashed and showed its error page"}.get(kind, "The test's check failed"),
+            "text": text, "where": "31836-4fad.js:1:88062" if kind == "crash" else None, "snippet": snippet,
+            "count": count, "consistent": True, "known": known,
+            "example": {"title": "04-user-profile.spec.ts › J04 › opens the profile modal", "file": "04.spec.ts",
+                        "trace_url": "https://trace.playwright.dev/?trace=x", "screenshot_url": "https://tests.iblai.app/s.png"}}
+
+CRASHED = {**FAILED, "headline": f"Your build crashes in 37 of 61 failing tests: {CRASH}",
+           "causes": [cause("crash", 37, CRASH, snippet="…M?.social_links.find(e=>e.platform)…"),
+                      cause("symptom", 13, "Error: expect(locator).toBeVisible() failed | Locator: getByRole('button')"),
+                      cause("symptom", 4, "J55 env not provisioned", known=True)]}
+DEPS = m.deps_from_patch('@@ -40 +40 @@\n-    "@iblai/iblai-js": "2.50.1",\n+    "@iblai/iblai-js": "2.58.1",\n     "next": "15.5.28",')
+body, _ = show(CRASHED, deps=DEPS)
+check("the causes table leads with the crash, its count and where it happened",
+      f"| 37 | App crash: `{CRASH}` at `31836-4fad.js:1:88062` | J04 › opens the profile modal" in body
+      or f"| 37 | App crash: `{CRASH}` at `31836-4fad.js:1:88062` | opens the profile modal" in body, True)
+check("...with the example's screenshot and trace",
+      "[screenshot](https://tests.iblai.app/s.png) · [trace](https://trace.playwright.dev/?trace=x)" in body, True)
+check("...a pipe in the error cannot break the table", "toBeVisible() failed \\| Locator" in body, True)
+check("...the code at the crash is quoted", "…M?.social_links.find(e=>e.platform)…" in body, True)
+check("...and the SDK bump in this PR is pointed at",
+      "**Hint:** this PR changes `@iblai/iblai-js` `2.50.1` → `2.58.1`." in body, True)
+check("known failures are set apart as probably not from the PR",
+      "Probably not from your PR (known issues): 4 × The test's check failed" in body
+      and "| 4 |" not in body, True)
+check("a crash among failed tests is still titled 'failed', not 'couldn't run your build'",
+      show({**CRASHED, "pattern": "tests_failed_crash"})[0].splitlines()[1], "### ❌ PR E2E failed")
+check("the hint needs a dependency change", "**Hint:**" in show(CRASHED)[0], False)
+check("...and a crash or browser error to point it at",
+      "**Hint:**" in show({**CRASHED, "causes": [cause("symptom", 30, "x")]}, deps=DEPS)[0], False)
+check("dependency diffs: only changed versions count",
+      m.deps_from_patch('-  "a": "1",\n+  "a": "2",\n+  "b": "1",\n-  "c": "3",\n--- a/package.json\n+++ b/package.json'),
+      [("a", "1", "2")])
+
 # ---- older central runs (v1 fields only) and runs that left nothing --------------------------
 v1 = {**BASE, "verdict": "failure", "gate": "FAIL", "failed": "3", "new_failures": "3", "report_url": "https://t/r"}
 check("a v1 failure still reads as failed tests", show(v1)[1]["headline"], "3 tests failed against prod 1.340.0.")

@@ -5,8 +5,8 @@ shown on the run page and in the merge box.
     render.py --result pr-e2e-result.json --out-body body.md --out-headline headline.json
 
 Reads the central run's pr-e2e-result.json (schema 2; older central runs wrote only the v1 fields,
-and a run that never started wrote nothing) and what this caller knows itself, from the environment:
-DISPATCH_CONCLUSION, JOB_STATUS, RUN_ID, HEAD_SHA, EVICTIONS, PREV_REPORT. No network: action.yml posts.
+and a run that never started wrote nothing) and what this caller knows itself, from the environment: DISPATCH_CONCLUSION, JOB_STATUS, RUN_ID, HEAD_SHA,
+EVICTIONS, PREV_REPORT, and --patch (the PR's package.json diff). No network: action.yml posts.
 """
 
 import argparse
@@ -101,7 +101,8 @@ def block(lines):
 
 
 def title_key(v):
-    if v["outcome"] == "failed" and v.get("pattern") not in (None, "", "tests_failed"):
+    # Failed tests (tests_failed, tests_failed_crash, …) vs. a build that never reached them.
+    if v["outcome"] == "failed" and v.get("pattern") and not v["pattern"].startswith("tests_failed"):
         return "failed_setup"
     return v["outcome"] if v["outcome"] in TITLES else "unknown"
 
@@ -129,6 +130,56 @@ def tests_line(t):
     return " · ".join(parts)
 
 
+KIND_LABEL = {"crash": "App crash", "js_error": "Browser error", "server_5xx": "Server error", "symptom": "Check failed"}
+DEP = re.compile(r'^([-+])\s*"(@?[\w./-]+)"\s*:\s*"([^"]+)",?\s*$')
+
+
+def deps_from_patch(patch):
+    """Dependency versions a package.json diff changes: [(name, old, new)]."""
+    old, new = {}, {}
+    for line in (patch or "").splitlines():
+        if line.startswith(("---", "+++")):
+            continue
+        m = DEP.match(line)
+        if m:
+            (old if m.group(1) == "-" else new)[m.group(2)] = m.group(3)
+    return [(n, old[n], new[n]) for n in new if n in old and old[n] != new[n]]
+
+
+def cell(text):
+    """Table-safe: a pipe would end the cell, a newline the row."""
+    return neutral(" ".join(str(text).split()).replace("|", "\\|"))
+
+
+def causes_block(v, deps):
+    """What really broke, grouped (central failure-causes.py): new causes as a table, known ones apart."""
+    causes = v.get("causes") or []
+    new = [c for c in causes if not c.get("known")]
+    known = [c for c in causes if c.get("known")]
+    lines = []
+    if new:
+        lines += ["", "| Tests | What went wrong | Example |", "|---:|---|---|"]
+        for c in new:
+            ex = c.get("example") or {}
+            test = cell((ex.get("title") or "").split(" › ")[-1])
+            links = " · ".join(f"[{label}]({ex[k]})" for k, label in (("screenshot_url", "screenshot"), ("trace_url", "trace"))
+                               if ex.get(k))
+            where = f" at {code(c['where'])}" if c.get("where") else ""
+            lines.append(f"| {c.get('count', 0)} | {KIND_LABEL.get(c.get('kind'), 'Failed')}: {code(c.get('text', '')).replace('|', chr(92) + '|')}"
+                         f"{where} | {test}{' · ' + links if links else ''} |")
+        top = new[0]
+        if top.get("snippet"):
+            lines += ["", "Code at that spot:"] + block([top["snippet"]])
+        if top.get("kind") in ("crash", "js_error") and deps:
+            change = ", ".join(f"{code(n)} {code(a)} → {code(b)}" for n, a, b in deps[:3])
+            lines += ["", f"**Hint:** this PR changes {change}. A crash right after a dependency bump usually comes "
+                          "from the new version."]
+    if known:
+        lines += ["", "Probably not from your PR (known issues): "
+                  + "; ".join(f"{c.get('count', 0)} × {neutral(c.get('plain', ''))}" for c in known)]
+    return lines
+
+
 def render(v, ctx):
     """The comment body (markdown) and the headline record."""
     report = v.get("report_url") or ""
@@ -136,6 +187,7 @@ def render(v, ctx):
     lines = [marker_for(v), f"### {TITLES[title_key(v)]}", "", f"**{neutral(v['headline'])}**"]
     if v.get("advice"):
         lines += ["", neutral(v["advice"])]
+    lines += causes_block(v, ctx.get("deps") or [])
     if report:
         lines += ["", f"**[{label}]({report})**"]
     counts = tests_line(v.get("tests") or {})
@@ -178,6 +230,7 @@ def main(argv=None):
     ap.add_argument("--result", required=True, help="pr-e2e-result.json (may be missing)")
     ap.add_argument("--out-body", required=True)
     ap.add_argument("--out-headline", required=True)
+    ap.add_argument("--patch", default="", help="the PR's package.json diff, for the dependency-bump hint")
     args = ap.parse_args(argv)
     try:
         with open(args.result, encoding="utf-8") as f:
@@ -186,8 +239,15 @@ def main(argv=None):
         result = {}
     e = os.environ
     view = normalize(result, e.get("DISPATCH_CONCLUSION", ""), e.get("JOB_STATUS", ""), _int(e.get("EVICTIONS")) or 0)
+    patch = ""
+    if args.patch:
+        try:
+            with open(args.patch, encoding="utf-8") as f:
+                patch = f.read()
+        except OSError:
+            pass
     body, head = render(view, {"run_id": e.get("RUN_ID", ""), "head_sha": e.get("HEAD_SHA", ""),
-                               "prev_report": e.get("PREV_REPORT", "")})
+                               "prev_report": e.get("PREV_REPORT", ""), "deps": deps_from_patch(patch)})
     with open(args.out_body, "w", encoding="utf-8") as f:
         f.write(body)
     with open(args.out_headline, "w", encoding="utf-8") as f:

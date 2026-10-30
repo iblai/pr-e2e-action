@@ -370,6 +370,7 @@ runs:
         DISPATCH_CONCLUSION: ${{ steps.dispatch.outputs.conclusion }}
         EVICTIONS: ${{ steps.dispatch.outputs.evictions }}
         HEAD_SHA: ${{ inputs.head_sha }}
+        BASE_SHA: ${{ inputs.base_sha }}
       shell: bash
       run: |
         set -uo pipefail
@@ -395,7 +396,11 @@ runs:
           2>/dev/null | tail -1 || true)
         export PREV_REPORT
 
-        python3 "$GITHUB_ACTION_PATH/render.py" --result "$RES/pr-e2e-result.json" \
+        # The PR's package.json changes: a crash right after a dependency bump is worth pointing at.
+        GH_TOKEN="$REPO_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}" \
+          --jq '.files[] | select(.filename | test("(^|/)package\\.json$")) | .patch // empty' > "$RES/deps.patch" 2>/dev/null || true
+
+        python3 "$GITHUB_ACTION_PATH/render.py" --result "$RES/pr-e2e-result.json" --patch "$RES/deps.patch" \
           --out-body "$RES/body.md" --out-headline "$RES/headline.json"
         cat "$RES/body.md" >> "$GITHUB_STEP_SUMMARY"
         cat "$RES/body.md"
