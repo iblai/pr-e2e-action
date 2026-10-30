@@ -5,8 +5,8 @@ shown on the run page and in the merge box.
     render.py --result pr-e2e-result.json --out-body body.md --out-headline headline.json
 
 Reads the central run's pr-e2e-result.json (schema 2; older central runs wrote only the v1 fields,
-and a run that never started wrote nothing) and what this caller knows itself, from the environment:
-DISPATCH_CONCLUSION, JOB_STATUS, RUN_ID, HEAD_SHA, EVICTIONS, PREV_REPORT. No network: action.yml posts.
+and a run that never started wrote nothing) and what this caller knows itself, from the environment: DISPATCH_CONCLUSION, JOB_STATUS, RUN_ID, HEAD_SHA,
+EVICTIONS, PREV_REPORT, and --patch (the PR's package.json diff). No network: action.yml posts.
 """
 
 import argparse
@@ -101,7 +101,8 @@ def block(lines):
 
 
 def title_key(v):
-    if v["outcome"] == "failed" and v.get("pattern") not in (None, "", "tests_failed"):
+    # Failed tests (tests_failed, tests_failed_crash, …) vs. a build that never reached them.
+    if v["outcome"] == "failed" and v.get("pattern") and not v["pattern"].startswith("tests_failed"):
         return "failed_setup"
     return v["outcome"] if v["outcome"] in TITLES else "unknown"
 
@@ -129,6 +130,89 @@ def tests_line(t):
     return " · ".join(parts)
 
 
+KIND_LABEL = {"crash": "App crash", "js_error": "Browser error", "server_5xx": "Server error", "symptom": "Check failed"}
+DEP = re.compile(r'^([-+])\s*"(@?[\w./-]+)"\s*:\s*"([^"]+)",?\s*$')
+
+
+def deps_from_patch(patch):
+    """Dependency versions a package.json diff changes: [(name, old, new)]."""
+    old, new = {}, {}
+    for line in (patch or "").splitlines():
+        if line.startswith(("---", "+++")):
+            continue
+        m = DEP.match(line)
+        if m:
+            (old if m.group(1) == "-" else new)[m.group(2)] = m.group(3)
+    return [(n, old[n], new[n]) for n in new if n in old and old[n] != new[n]]
+
+
+def cell(text):
+    """Table-safe: a pipe would end the cell, a newline the row."""
+    return neutral(" ".join(str(text).split()).replace("|", "\\|"))
+
+
+def causes_block(v, deps):
+    """What really broke, grouped (central failure-causes.py): new causes as a table, known ones apart."""
+    causes = v.get("causes") or []
+    new = [c for c in causes if not c.get("known")]
+    known = [c for c in causes if c.get("known")]
+    own = [c for c in new if not c.get("seen_elsewhere")]
+    lines = []
+    if new:
+        lines += ["", "| Tests | What went wrong | Example |", "|---:|---|---|"]
+        for c in new:
+            ex = c.get("example") or {}
+            test = cell((ex.get("title") or "").split(" › ")[-1])
+            links = " · ".join(f"[{label}]({ex[k]})" for k, label in (("screenshot_url", "screenshot"), ("trace_url", "trace"))
+                               if ex.get(k))
+            where = f" at {code(c['where'])}" if c.get("where") else ""
+            if c.get("seen_elsewhere"):
+                where += f" — also failing on {cell(', '.join(c['seen_elsewhere']))}, probably not yours"
+            lines.append(f"| {c.get('count', 0)} | {KIND_LABEL.get(c.get('kind'), 'Failed')}: {code(c.get('text', '')).replace('|', chr(92) + '|')}"
+                         f"{where} | {test}{' · ' + links if links else ''} |")
+        top = own[0] if own else new[0]
+        if top.get("snippet"):
+            lines += ["", "Code at that spot:"] + block([top["snippet"]])
+        if own and top.get("kind") in ("crash", "js_error") and deps:
+            change = ", ".join(f"{code(n)} {code(a)} → {code(b)}" for n, a, b in deps[:3])
+            lines += ["", f"**Hint:** this PR changes {change}. A crash right after a dependency bump usually comes "
+                          "from the new version."]
+    if known:
+        lines += ["", "Probably not from your PR (known issues): "
+                  + "; ".join(f"{c.get('count', 0)} × {neutral(c.get('plain', ''))}" for c in known)]
+    return lines
+
+
+EARLY = 10  # tests sharing one crash or browser error before the PR is warned
+
+
+def progress_line(live):
+    """One line for the caller's log while the suite runs."""
+    line = f"e2e progress: {live.get('passed', 0)} passed, {live.get('failed', 0)} failed so far"
+    top = (live.get("causes") or [None])[0]
+    if top:
+        line += f"; most common: {KIND_LABEL.get(top.get('kind'), top.get('kind'))} x{top.get('count')} {code(top.get('text', '')[:80])}"
+    return line
+
+
+def early_warning(live, threshold=EARLY):
+    """The one comment posted mid-run when a crash or browser error has already hit `threshold` tests."""
+    top = (live.get("causes") or [None])[0]
+    if not top or top.get("kind") not in ("crash", "js_error") or (top.get("count") or 0) < threshold:
+        return None
+    what = "crashes" if top["kind"] == "crash" else "throws a browser error"
+    return "\n".join([
+        "<!-- pr-e2e-early -->",
+        "### ⚠️ PR E2E early warning: your build looks broken",
+        "",
+        f"**{top['count']} tests so far: your build {what}: {code(top.get('text', ''))}**",
+        "",
+        f"The run keeps going ({live.get('passed', 0)} passed, {live.get('failed', 0)} failed so far). The full result, "
+        "with every cause, a screenshot and a trace, is posted when it finishes. You can fix and push now; the push "
+        "starts a new run.",
+    ]) + "\n"
+
+
 def render(v, ctx):
     """The comment body (markdown) and the headline record."""
     report = v.get("report_url") or ""
@@ -136,6 +220,7 @@ def render(v, ctx):
     lines = [marker_for(v), f"### {TITLES[title_key(v)]}", "", f"**{neutral(v['headline'])}**"]
     if v.get("advice"):
         lines += ["", neutral(v["advice"])]
+    lines += causes_block(v, ctx.get("deps") or [])
     if report:
         lines += ["", f"**[{label}]({report})**"]
     counts = tests_line(v.get("tests") or {})
@@ -175,10 +260,27 @@ def render(v, ctx):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--result", required=True, help="pr-e2e-result.json (may be missing)")
-    ap.add_argument("--out-body", required=True)
-    ap.add_argument("--out-headline", required=True)
+    ap.add_argument("--result", help="pr-e2e-result.json (may be missing)")
+    ap.add_argument("--out-body")
+    ap.add_argument("--out-headline")
+    ap.add_argument("--live", help="progress mode: the run's live.json; prints a progress line")
+    ap.add_argument("--out-warning", help="progress mode: write the early-warning comment here when it is due")
+    ap.add_argument("--patch", default="", help="the PR's package.json diff, for the dependency-bump hint")
     args = ap.parse_args(argv)
+    if args.live:
+        try:
+            with open(args.live, encoding="utf-8") as f:
+                live = json.load(f)
+        except (OSError, ValueError):
+            return 0
+        print(progress_line(live))
+        warning = early_warning(live)
+        if warning and args.out_warning:
+            with open(args.out_warning, "w", encoding="utf-8") as f:
+                f.write(warning)
+        return 0
+    if not (args.result and args.out_body and args.out_headline):
+        ap.error("--result, --out-body and --out-headline are required (or --live)")
     try:
         with open(args.result, encoding="utf-8") as f:
             result = json.load(f)
@@ -186,8 +288,15 @@ def main(argv=None):
         result = {}
     e = os.environ
     view = normalize(result, e.get("DISPATCH_CONCLUSION", ""), e.get("JOB_STATUS", ""), _int(e.get("EVICTIONS")) or 0)
+    patch = ""
+    if args.patch:
+        try:
+            with open(args.patch, encoding="utf-8") as f:
+                patch = f.read()
+        except OSError:
+            pass
     body, head = render(view, {"run_id": e.get("RUN_ID", ""), "head_sha": e.get("HEAD_SHA", ""),
-                               "prev_report": e.get("PREV_REPORT", "")})
+                               "prev_report": e.get("PREV_REPORT", ""), "deps": deps_from_patch(patch)})
     with open(args.out_body, "w", encoding="utf-8") as f:
         f.write(body)
     with open(args.out_headline, "w", encoding="utf-8") as f:

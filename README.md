@@ -18,6 +18,13 @@ it says whose problem it is and what to do.
 | ⏹️ **PR E2E stopped** | The run was cancelled, usually because a newer commit or another `/retest` replaced it. | `/retest` if you still need a result. |
 | ❓ **PR E2E failed**, cause unclear | The pipeline couldn't tell why. | **Details** has what it saw. `/retest`, and tell the ops team if it happens again. |
 
+When tests fail, the comment groups them by what really broke: an app crash, a browser error, a
+server error, or the check that failed. Each group has an example with its screenshot and trace,
+and a crash comes with the code at that spot. A failure that other PRs' runs hit in the last two
+days is marked "also failing on …, probably not yours", and known failures are set apart. If your
+build crashes in 10 or more tests while the suite is still running, you get a ⚠️ **early
+warning** comment within minutes. The run keeps going, and you can push a fix right away.
+
 The same sentence is at the top of the *E2E* check's run page. In os and lms it is also the
 **PR Validation** status in the merge box, linked to the comment. `/status` says what your run is
 doing right now; `/report` links the latest report. The pipeline run linked under **Details** is
