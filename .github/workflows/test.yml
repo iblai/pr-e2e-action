@@ -1,0 +1,24 @@
+name: test
+
+# render.py writes what every SPA developer reads when their e2e run ends; its tests run here.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: |
+          rc=0
+          for t in tests/test-*.py; do
+            echo "::group::$t"; python3 -B "$t" || rc=1; echo "::endgroup::"
+          done
+          exit "$rc"

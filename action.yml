@@ -351,122 +351,110 @@ runs:
           echo "::notice::QUEUE_EVICTION_COUNT=${EVICTIONS} for this PR"
         fi
         echo "conclusion=${CONCLUSION:-unknown}" >> "$GITHUB_OUTPUT"
+    - name: Note a cancelled caller
+      # A superseded caller still says what happened instead of leaving the PR silent. Status
+      # functions only work in `if:`, hence a step of its own.
+      if: cancelled()
+      shell: bash
+      run: touch "$RUNNER_TEMP/pr-e2e-cancelled"
+
     - name: Publish the result on this PR
-      if: always() && steps.dispatch.outputs.run_id != ''
+      # always(), with or without a central run: a run that never started (queue full, runners
+      # offline, dispatch failed) or was cancelled still tells the developer what happened.
+      if: always()
       env:
         GH_TOKEN: ${{ inputs.dispatch_token }}
         REPO_TOKEN: ${{ inputs.repo_token }}
         RUN_ID: ${{ steps.dispatch.outputs.run_id }}
         PR: ${{ inputs.pr_number }}
         DISPATCH_CONCLUSION: ${{ steps.dispatch.outputs.conclusion }}
+        EVICTIONS: ${{ steps.dispatch.outputs.evictions }}
         HEAD_SHA: ${{ inputs.head_sha }}
       shell: bash
       run: |
         set -uo pipefail
-        # The Playwright report on tests.iblai.app IS public, so it is the link that actually helps
-        # a developer here — unlike the private Actions run. Relay it onto the PR itself.
-        # Retry briefly: the artifact is uploaded by the central run's LAST job, so a caller that
-        # reaches here early (or races the upload) would otherwise silently render "unknown" and
-        # throw away a perfectly good result — which is exactly how os#367 lost its report link.
-        for a in 1 2 3 4 5 6; do
-          gh run download "$RUN_ID" -R iblai/iblai-deploy-ops -n pr-e2e-result -D /tmp/res 2>/dev/null && break
-          echo "  result artifact not available yet (attempt $a/6) — retrying in 20s"
-          sleep 20
-        done
-        if [ ! -f /tmp/res/pr-e2e-result.json ]; then
-          echo "::warning::could not download pr-e2e-result from run ${RUN_ID} — the comment will lack a report link. https://github.com/iblai/iblai-deploy-ops/actions/runs/${RUN_ID}"
+        RES="$RUNNER_TEMP/pr-e2e-res"; mkdir -p "$RES"
+        [ -f "$RUNNER_TEMP/pr-e2e-cancelled" ] && export JOB_STATUS=cancelled
+        # The central run's verdict job writes the explanation (headline, whose problem, what to do,
+        # the public report link). Retry briefly: it is the run's LAST job, so a caller that reaches
+        # here early would otherwise render nothing (os#367 lost its report link that way).
+        if [ -n "$RUN_ID" ]; then
+          for a in 1 2 3 4 5 6; do
+            gh run download "$RUN_ID" -R iblai/iblai-deploy-ops -n pr-e2e-result -D "$RES" 2>/dev/null && break
+            echo "  result artifact not available yet (attempt $a/6) — retrying in 20s"
+            sleep 20
+          done
+          [ -f "$RES/pr-e2e-result.json" ] || echo "::warning::could not download pr-e2e-result from run ${RUN_ID}; the comment says only what this caller saw. https://github.com/iblai/iblai-deploy-ops/actions/runs/${RUN_ID}"
         fi
 
-        # Carry the PREVIOUS comment forward. A run that produced nothing must never erase a run
-        # that produced something: an evicted dispatch used to overwrite a real verdict with
-        # "unknown", losing the only PR-visible link to a perfectly good report (os#405, 2026-08-04
-        # — a 452/3/6 result vanished behind an eviction that never started a test).
-        GH_TOKEN="$REPO_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
-          --jq '[.[] | select(.body | startswith("<!-- pr-e2e-report -->"))] | .[-1].body // empty' \
-          > /tmp/prev.md 2>/dev/null || : > /tmp/prev.md
+        # The last real report on this PR, offered when this run produced none, so a run that
+        # produced nothing never buries one that did (os#405, 2026-08-04).
+        PREV_REPORT=$(GH_TOKEN="$REPO_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
+          --jq '[.[] | select(.body | startswith("<!-- pr-e2e-report -->")) | .body
+                 | capture("\\[Full report, traces and screenshots\\]\\((?<u>https?://[^)]+)\\)").u] | .[-1] // empty' \
+          2>/dev/null | tail -1 || true)
+        export PREV_REPORT
 
-        python3 - <<'PY' > /tmp/body.md
-        import json, os, pathlib, re
-        p = pathlib.Path("/tmp/res/pr-e2e-result.json")
-        d = json.loads(p.read_text()) if p.exists() else {}
-        # The dispatch step already knows how the central run ended. Falling back to "unknown"
-        # threw that away and told the developer to find a maintainer.
-        v    = d.get("verdict") or os.environ.get("DISPATCH_CONCLUSION") or "unknown"
-        icon = {"success": "OK", "failure": "FAILED", "cancelled": "NOT RUN"}.get(v, v)
-        rep  = d.get("report_url") or ""
-        rows = [("result", f"**{icon}**")]
-        rid = os.environ.get("RUN_ID", "")
-        if rid:
-            rows.append(("central run", f"[`{rid}`](https://github.com/iblai/iblai-deploy-ops/actions/runs/{rid})"))
-        hsha = os.environ.get("HEAD_SHA", "")
-        if hsha:
-            rows.append(("commit", f"`{hsha[:8]}`"))
-        if d.get("platform"):
-            rows.append(("suite", f'`{d["platform"]}` - mode `{d.get("mode","?")}` - env `{d.get("target_env","?")}`'))
-        if d.get("baseline"):
-            synced = " (env was synced to it first)" if d.get("drifted") == "true" else " (env already on it)"
-            rows.append(("tested against", f'prod release `{d["baseline"]}`{synced}'))
-        for label, key in (("failed", "failed"), ("new failures", "new_failures")):
-            if d.get(key) not in (None, ""):
-                rows.append((label, f'`{d[key]}`'))
-        # Two comment identities, deliberately:
-        #   * a run that PRODUCED a report posts its own comment and is never edited, so the PR
-        #     conversation keeps a run-by-run history of what was tested and when;
-        #   * a run that produced NOTHING updates one sticky notice instead — a label recycle fires
-        #     two events, so cancelled dispatches would otherwise spam the thread.
-        # This also kills the overwrite hazard structurally rather than by carrying text forward:
-        # nothing can bury a real verdict if real verdicts are never edited.
-        marker = "<!-- pr-e2e-report -->" if rep else "<!-- pr-e2e-norun -->"
-        pathlib.Path("/tmp/marker").write_text(marker)
-        out = [marker, f"### PR E2E - {icon}", ""]
-        if rep:
-            out += [f"**[Full report, traces and screenshots]({rep})**", ""]
-        out += ["| | |", "|---|---|"] + [f"| {k} | {val} |" for k, val in rows]
+        python3 "$GITHUB_ACTION_PATH/render.py" --result "$RES/pr-e2e-result.json" \
+          --out-body "$RES/body.md" --out-headline "$RES/headline.json"
+        cat "$RES/body.md" >> "$GITHUB_STEP_SUMMARY"
+        cat "$RES/body.md"
 
-        if not rep:
-            out += ["", f"**No test report was produced** (result: `{v}`). The run did not finish a"
-                        " suite — usually because another PR's run took the shared environment, a newer"
-                        " commit/label superseded this one, or it was abandoned before completing."
-                        " **This says nothing about your code.**", "",
-                    "Re-trigger it yourself: comment **`/retest`** (or `/retest <spec>` to re-run"
-                    " a single file in minutes). `/status` shows the queue."
-                    " (Avoid *Re-run jobs* — that replays the old merge ref instead of"
-                    " recomputing it against current `main`.)"]
-            # Preserve the last known-good report so an eviction cannot bury a real result.
-            prev = pathlib.Path("/tmp/prev.md").read_text() if pathlib.Path("/tmp/prev.md").exists() else ""
-            m = re.search(r"\[Full report, traces and screenshots\]\((https?://[^)]+)\)", prev)
-            if m:
-                out += ["", f"Last completed run for this PR: **[report]({m.group(1)})** —"
-                            " still valid unless this PR has changed since."]
-        print("\n".join(out))
-        PY
-        cat /tmp/body.md >> "$GITHUB_STEP_SUMMARY"
-        cat /tmp/body.md
-
-        python3 -c "import json;print(json.dumps({'body':open('/tmp/body.md').read()}))" > /tmp/payload.json
-        MARKER=$(cat /tmp/marker 2>/dev/null || echo "<!-- pr-e2e-norun -->")
-        if [ "$MARKER" = "<!-- pr-e2e-report -->" ]; then
-          CID=""   # a real result always gets its OWN comment — history, and nothing overwritten
-        else
-          # no result: reuse the single sticky notice rather than spam the thread
+        # A real result is a NEW comment (the developer is notified, the history is kept). Only a
+        # stopped run updates the single sticky notice: a label recycle fires two events.
+        python3 -c "import json,sys;print(json.dumps({'body':open(sys.argv[1]).read()}))" "$RES/body.md" > "$RES/payload.json"
+        MARKER=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['marker'])" "$RES/headline.json")
+        CID=""
+        if [ "$MARKER" = "<!-- pr-e2e-norun -->" ]; then
           CID=$(GH_TOKEN="$REPO_TOKEN" gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" --paginate \
-                  --jq '[.[] | select(.body | startswith("<!-- pr-e2e-norun -->"))] | .[-1].id // empty' 2>/dev/null || true)
+                  --jq '[.[] | select(.body | startswith("<!-- pr-e2e-norun -->"))] | .[-1].id // empty' 2>/dev/null | tail -1 || true)
         fi
+        URL=""
         if [ -n "$CID" ]; then
-          GH_TOKEN="$REPO_TOKEN" gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${CID}" \
-            --input /tmp/payload.json >/dev/null && echo "updated PR comment $CID"
+          URL=$(GH_TOKEN="$REPO_TOKEN" gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${CID}" \
+                  --input "$RES/payload.json" --jq .html_url) && echo "updated PR comment $CID"
         else
-          GH_TOKEN="$REPO_TOKEN" gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
-            --input /tmp/payload.json >/dev/null && echo "posted PR comment"
+          URL=$(GH_TOKEN="$REPO_TOKEN" gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+                  --input "$RES/payload.json" --jq .html_url) && echo "posted PR comment"
         fi
+        python3 -c "import json,sys;d=json.load(open(sys.argv[1]));d['comment_url']=sys.argv[2];json.dump(d,open(sys.argv[1],'w'))" \
+          "$RES/headline.json" "${URL:-}"
+        cp "$RES/headline.json" "$RUNNER_TEMP/pr-e2e-headline.json"
+
+    - name: Keep the headline for the merge box
+      # pr-gate.yml (os, lms) puts the same sentence on the PR Validation status, linked to the comment.
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pr-e2e-headline
+        path: ${{ runner.temp }}/pr-e2e-headline.json
+        if-no-files-found: ignore
+        overwrite: true
+        retention-days: 7
 
     - name: Gate on the e2e result
       if: always()
+      env:
+        CONCLUSION: ${{ steps.dispatch.outputs.conclusion }}
       shell: bash
       run: |
-        C="${{ steps.dispatch.outputs.conclusion }}"
-        echo "e2e conclusion: ${C:-<none>}"
-        [ "$C" = "success" ]
+        echo "e2e conclusion: ${CONCLUSION:-<none>}"
+        [ "$CONCLUSION" = "success" ] && exit 0
+        # The PR comment's sentence, at the top of the run page instead of a bare "exit code 1".
+        python3 -c '
+        import json, sys
+        def esc(s, prop=False):
+            s = s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            return s.replace(":", "%3A").replace(",", "%2C") if prop else s
+        try:
+            d = json.load(open(sys.argv[1]))
+        except (OSError, ValueError):
+            d = {}
+        link = d.get("comment_url") or d.get("report_url") or ""
+        print("::error title=" + esc(d.get("headline") or "The e2e run did not pass.", True) + "::"
+              + esc("Details: " + link if link else "See the PR comment for details."))
+        ' "$RUNNER_TEMP/pr-e2e-headline.json"
+        exit 1
 # ============================================================
 # SUMMARY
 # ============================================================

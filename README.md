@@ -4,6 +4,25 @@ Runs the Playwright e2e suites for a pull request in **`iblai/os`**, **`iblai/lm
 **`iblai/iblai-web-frontend`**, by dispatching the central pipeline in `iblai/iblai-deploy-ops`,
 streaming its progress back into the caller's log, and publishing the report link onto the PR.
 
+## Reading your PR e2e result
+
+Every run ends with a comment on your PR. Its title says what happened, and the bold sentence under
+it says whose problem it is and what to do.
+
+| The comment says | What it means | What to do |
+|---|---|---|
+| ✅ **PR E2E passed** | Every test passed against the release running in prod. | Nothing. |
+| ❌ **PR E2E failed** | The tests ran and some failed. | Open **Full report, traces and screenshots**. Every failure has a screenshot and a trace; the trace's **Console** tab shows browser errors. `/retest <spec>` re-runs one file in minutes. |
+| ❌ **PR E2E couldn't run your build** | Your build never got as far as the tests: it didn't start on the test server, or its e2e tests didn't build. | **Details** has the error and the last lines it printed. |
+| ⚠️ **infrastructure problem, not your code** | The shared test environment failed, not your PR. | Nothing in your PR. Comment `/retest`; if it fails the same way, tell the ops team. |
+| ⏹️ **PR E2E stopped** | The run was cancelled, usually because a newer commit or another `/retest` replaced it. | `/retest` if you still need a result. |
+| ❓ **PR E2E failed**, cause unclear | The pipeline couldn't tell why. | **Details** has what it saw. `/retest`, and tell the ops team if it happens again. |
+
+The same sentence is at the top of the *E2E* check's run page. In os and lms it is also the
+**PR Validation** status in the merge box, linked to the comment. `/status` says what your run is
+doing right now; `/report` links the latest report. The pipeline run linked under **Details** is
+private and only for maintainers: everything you need is in the comment and the report.
+
 ## Why this is an action, and not a workflow in each repo
 
 A `pull_request` event runs workflows from the PR's **merge ref**. A workflow copied into each repo
