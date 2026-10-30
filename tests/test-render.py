@@ -125,6 +125,49 @@ check("dependency diffs: only changed versions count",
       m.deps_from_patch('-  "a": "1",\n+  "a": "2",\n+  "b": "1",\n-  "c": "3",\n--- a/package.json\n+++ b/package.json'),
       [("a", "1", "2")])
 
+# ---- failures other PRs hit too ----------------------------------------------------------------
+SHARED = {**CRASHED, "causes": [{**cause("crash", 40, CRASH, snippet="…shared…"), "seen_elsewhere": ["os#610"]},
+                                cause("js_error", 12, "ReferenceError: tour is not defined", snippet="…own…")]}
+body, _ = show(SHARED, deps=DEPS)
+check("a cause other PRs hit too says so, as probably not this PR's",
+      m.neutral("— also failing on os#610, probably not yours |") in body, True)
+check("...the code quoted is this PR's own top cause", ("…own…" in body, "…shared…" in body), (True, False))
+check("...and the hint follows this PR's own cause", "**Hint:**" in body, True)
+only_shared = {**CRASHED, "causes": [{**cause("crash", 40, CRASH), "seen_elsewhere": ["os#610"]}]}
+check("no hint when every cause is shared with other PRs", "**Hint:**" in show(only_shared, deps=DEPS)[0], False)
+
+# ---- while the suite runs: progress and the early warning ---------------------------------------
+LIVE = {"status": "running", "passed": 298, "failed": 74, "causes": [{"kind": "crash", "text": CRASH, "count": 35}]}
+check("progress names the counts and the most common cause",
+      m.progress_line(LIVE), f"e2e progress: 298 passed, 74 failed so far; most common: App crash x35 `{CRASH}`")
+check("progress without causes is just the counts", m.progress_line({"passed": 3, "failed": 0}), "e2e progress: 3 passed, 0 failed so far")
+w = m.early_warning(LIVE) or ""
+check("35 tests on one crash: an early warning, as its own comment", w.splitlines()[:2],
+      ["<!-- pr-e2e-early -->", "### ⚠️ PR E2E early warning: your build looks broken"])
+check("...saying how many, which error, and that the run continues",
+      (f"**35 tests so far: your build crashes: `{CRASH}`**" in w, "The run keeps going" in w), (True, True))
+check("a browser error warns too", "throws a browser error" in (m.early_warning({**LIVE, "causes": [{"kind": "js_error", "text": "x", "count": 10}]}) or ""), True)
+for label, causes in [("9 tests is not enough", [{"kind": "crash", "text": "x", "count": 9}]),
+                      ("a symptom never warns", [{"kind": "symptom", "text": "x", "count": 50}]),
+                      ("a server error never warns", [{"kind": "server_5xx", "text": "x", "count": 50}]),
+                      ("no causes, no warning", [])]:
+    check(label, m.early_warning({**LIVE, "causes": causes}), None)
+with tempfile.TemporaryDirectory() as tmp:
+    lp, wp = os.path.join(tmp, "live.json"), os.path.join(tmp, "warn.md")
+    json.dump(LIVE, open(lp, "w"))
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        m.main(["--live", lp, "--out-warning", wp])
+    check("the live mode prints progress and writes the warning when due",
+          (out.getvalue().startswith("e2e progress: 298 passed"), os.path.exists(wp)), (True, True))
+    json.dump({**LIVE, "causes": []}, open(lp, "w"))
+    os.remove(wp)
+    with contextlib.redirect_stdout(io.StringIO()):
+        m.main(["--live", lp, "--out-warning", wp])
+    check("...and writes nothing when it isn't", os.path.exists(wp), False)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = m.main(["--live", os.path.join(tmp, "missing.json")])
+    check("...a live.json not published yet is not an error", rc, 0)
+
 # ---- older central runs (v1 fields only) and runs that left nothing --------------------------
 v1 = {**BASE, "verdict": "failure", "gate": "FAIL", "failed": "3", "new_failures": "3", "report_url": "https://t/r"}
 check("a v1 failure still reads as failed tests", show(v1)[1]["headline"], "3 tests failed against prod 1.340.0.")
