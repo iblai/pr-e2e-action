@@ -454,7 +454,7 @@ runs:
     - name: Keep the headline for the merge box
       # pr-gate.yml (os, lms) puts the same sentence on the PR Validation status, linked to the comment.
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
         name: pr-e2e-headline
         path: ${{ runner.temp }}/pr-e2e-headline.json
